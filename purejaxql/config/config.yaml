@@ -6,9 +6,9 @@ SEED: 0
 HYP_TUNE: False
 
 # wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
-ENTITY: ""
-PROJECT: ""
+WANDB_MODE: "online"  # set to online to activate wandb
+ENTITY: "doina-precup"
+PROJECT: "Craftax Experiments Generalize PT"
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 
