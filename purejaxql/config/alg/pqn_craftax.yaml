@@ -21,7 +21,7 @@ Q_LAMBDA: False
 LAMBDA: 0
 
 # env specific
-ENV_NAME: "Craftax-Symbolic-v1"
+ENV_NAME: "Craftax-Classic-Symbolic-v1"
 USE_OPTIMISTIC_RESETS: True
 OPTIMISTIC_RESET_RATIO: 16
 LOG_ACHIEVEMENTS: False
