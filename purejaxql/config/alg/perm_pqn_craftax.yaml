@@ -1,7 +1,7 @@
 ALG_NAME: "perm_pqn_craftax"
 TOTAL_TIMESTEPS: 1e9
 TOTAL_TIMESTEPS_DECAY: 1e9 # will be used for decay functions, in case you want to test for less timesteps and keep decays same
-NUM_ENVS: 16 # parallel environments
+NUM_ENVS: 1024 # parallel environments
 NUM_STEPS: 1 # steps per environment in each update
 EPS_START: 0.1
 EPS_FINISH: 0.005
@@ -19,6 +19,7 @@ REW_SCALE: 1.
 GAMMA: 0.99
 Q_LAMBDA: False
 LAMBDA: 0
+USE_PERM: False
 
 # env specific
 ENV_NAME: "Craftax-Classic-Symbolic-v1"

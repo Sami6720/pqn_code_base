@@ -29,6 +29,37 @@ from purejaxql.utils.craftax_wrappers import (
 )
 from purejaxql.utils.batch_renorm import BatchRenorm
 
+class QNetworkPerm(nn.Module):
+    action_dim: int
+    hidden_size: int = 512
+    num_layers: int = 4
+    norm_type: str = "batch_norm"
+    norm_input: bool = False
+    config: dict
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        if self.norm_input:
+            x = BatchRenorm(use_running_average=not train)(x)
+        else:
+            # dummy normalize input for global compatibility
+            x_dummy = BatchRenorm(use_running_average=not train)(x)
+
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        elif self.norm_type == "batch_norm":
+            normalize = lambda x: BatchRenorm(use_running_average=not train)(x)
+        else:
+            normalize = lambda x: x
+
+        for l in range(self.num_layers):
+            x = nn.Dense(self.hidden_size)(x)
+            x = normalize(x)
+            x = nn.relu(x)
+
+        x = nn.Dense(self.action_dim)(x)
+
+        return x
 
 class QNetwork(nn.Module):
     action_dim: int
@@ -157,6 +188,15 @@ def make_train(config):
             norm_input=config.get("NORM_INPUT", False),
         )
 
+        network_perm = QNetworkPerm(
+            action_dim=env.action_space(env_params).n,
+            hidden_size=config.get("HIDDEN_SIZE", 128),
+            num_layers=config.get("NUM_LAYERS", 2),
+            norm_type=config["NORM_TYPE"],
+            norm_input=config.get("NORM_INPUT", False),
+            config=config
+        )
+
         def create_agent(rng):
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
             network_variables = network.init(rng, init_x, train=False)
@@ -173,13 +213,35 @@ def make_train(config):
             )
             return train_state
 
+
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
+
+        if config["USE_PERM"]:
+            def create_agent_perm(rng):
+                init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+                network_variables = network_perm.init(rng, init_x, train=False)
+                tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.radam(learning_rate=lr),
+                )
+
+                train_state = CustomTrainState.create(
+                    apply_fn=network.apply,
+                    params=network_variables["params"],
+                    batch_stats=network_variables["batch_stats"],
+                    tx=tx,
+                )
+                return train_state
+            rng, _rng = jax.random.split(rng)
+            train_state_perm = create_agent_perm(_rng)
+        else:
+            train_state_perm = None
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
-            train_state, expl_state, test_metrics, rng = runner_state
+            train_state, train_state_perm, expl_state, test_metrics, rng = runner_state
 
             # SAMPLE PHASE
             def _step_env(carry, _):
@@ -193,6 +255,18 @@ def make_train(config):
                     last_obs,
                     train=False,
                 )
+                #TODO: Add q_perm values to the q_vals here.
+                if config["USE_PERM"]:
+                    q_vals_perm = network_perm.apply(
+                        {
+                            "params": train_state_perm.params,
+                            "batch_stats": train_state_perm.batch_stats
+                        },
+                        last_obs,
+                        train=False
+                    )
+
+                    q_vals += q_vals_perm
 
                 # different eps for each env
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
@@ -233,6 +307,7 @@ def make_train(config):
                     "params": train_state.params,
                     "batch_stats": train_state.batch_stats,
                 },
+                #TODO: Why use -1 to index
                 transitions.next_obs[-1],
                 train=False,
             )
@@ -272,7 +347,7 @@ def make_train(config):
                     train_state, rng = carry
                     minibatch, target = minibatch_and_target
 
-                    def _loss_fn(params):
+                    def _loss_fn(params, params_perm):
 
                         if config.get("Q_LAMBDA", False):
                             q_vals, updates = network.apply(
@@ -297,7 +372,24 @@ def make_train(config):
                             )
                             q_vals, q_next = jnp.split(all_q_vals, 2)
                             q_next = jax.lax.stop_gradient(q_next)
+
+                            #TODO: Need to add q_perm to both. Like an all_q_vals_perm
+                            if config["USE_PERM"]:
+                                all_q_vals_perm = network.apply(
+                                    {
+                                        "params": params_perm,
+                                        "batch_stats": train_state_perm.batch_stats,
+                                    },
+                                    jnp.concatenate((minibatch.obs, minibatch.next_obs)),
+                                    train=False,
+                                    )
+                                q_vals_perm, q_next_perm = jnp.split(all_q_vals_perm, 2)
+                                q_vals += q_vals_perm
+                                q_next += q_next_perm
+
+
                             q_next = jnp.max(q_next, axis=-1)  # (batch_size,)
+                            # NOTE: Lambda target from above is overwritten here when Q_Lamda is False
                             target = (
                                 minibatch.reward
                                 + (1 - minibatch.done) * config["GAMMA"] * q_next
@@ -315,7 +407,7 @@ def make_train(config):
 
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
-                    )(train_state.params)
+                    )(train_state.params, train_state_perm.params)
                     train_state = train_state.apply_gradients(grads=grads)
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
@@ -385,6 +477,88 @@ def make_train(config):
                 metrics = {
                     k: v for k, v in metrics.items() if "achievement" not in k.lower()
                 }
+
+            #TODO: Train the perm network here over the same minibatches with a jax.lax.cond
+            # UPDATE Perm Network
+            if config["USE_PERM"]:
+                def _learn_epoch_perm(carry, _):
+                    train_state_perm, rng = carry
+                    def _learn_phase_perm(carry, minibatch_and_target):
+
+                        train_state_perm, rng = carry
+                        minibatch, _ = minibatch_and_target
+
+                        def _loss_fn_perm(params_perm, params_trans):
+                            q_vals_perm, updates_perm = network_perm.apply(
+                                    {
+                                    "params": params_perm, 
+                                    "batch_stats": train_state_perm.batch_stats
+                                    },
+                                minibatch.obs,
+                                mutable=["batch_stats"],
+                                train=True
+                            )
+                            q_vals_perm = jnp.take_along_axis(
+                                q_vals_perm,
+                                jnp.expand_dims(minibatch.action, axis=-1),
+                                axis=-1,
+                            ).squeeze(axis=-1)
+                            q_vals_trans = network.apply(
+                                    {
+                                    "params": params_trans,
+                                    "batch_stats": train_state_perm.batch_stats
+                                    },
+                                minibatch.obs,
+                                train=False
+                            )
+                            q_vals_trans = jnp.take_along_axis(
+                                q_vals_trans,
+                                jnp.expand_dims(minibatch.action, axis=-1),
+                                axis=-1,
+                            ).squeeze(axis=-1)
+
+                            loss = 0.5 * jnp.square(q_vals_perm - q_vals_trans).mean()
+                            return loss, updates_perm
+
+                        (loss_perm, updates_perm), grads = jax.value_and_grad(
+                            _loss_fn_perm, has_aux=True
+                        )(train_state_perm.params, train_state.params)
+                        train_state_perm = train_state_perm.apply_gradients(grads=grads)
+                        train_state_perm = train_state_perm.replace(
+                            grad_steps=train_state_perm.grad_steps + 1,
+                            batch_stats=updates_perm["batch_stats"],
+                        )
+                        return (train_state_perm, rng), loss_perm
+
+                    def preprocess_transition_perm(x, rng):
+                        x = x.reshape(
+                            -1, *x.shape[2:]
+                        )  # num_steps*num_envs (batch_size), ...
+                        x = jax.random.permutation(rng, x)  # shuffle the transitions
+                        x = x.reshape(
+                            config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+                        )  # num_mini_updates, batch_size/num_mini_updates, ...
+                        return x
+
+                    rng, _rng = jax.random.split(rng)
+                    minibatches = jax.tree_util.tree_map(
+                        lambda x: preprocess_transition_perm(x, _rng), transitions
+                    )  # num_actors*num_envs (batch_size), ...
+                    targets = jax.tree_util.tree_map(
+                        lambda x: preprocess_transition_perm(x, _rng), lambda_targets
+                    )
+
+                    rng, _rng = jax.random.split(rng)
+                    (train_state_perm, rng), loss = jax.lax.scan(
+                        _learn_phase_perm, (train_state_perm, rng), (minibatches, targets)
+                    )
+
+                    return (train_state_perm, rng), loss
+
+                rng, _rng = jax.random.split(rng)
+                (train_state_perm, rng), loss_perm = jax.lax.scan(
+                    _learn_epoch_perm, (train_state_perm, rng), None, config["NUM_EPOCHS"]
+                )
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
@@ -457,7 +631,7 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, expl_state, test_metrics, _rng)
+        runner_state = (train_state, train_state_perm, expl_state, test_metrics, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
