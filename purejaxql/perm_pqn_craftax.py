@@ -39,18 +39,45 @@ class QNetworkPerm(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_input:
-            x = BatchRenorm(use_running_average=not train)(x)
-        else:
+        if "Pixels" in self.config["ENV_NAME"]:
+            B, H, W, C = x.shape
+
+            if self.config["USE_CONV_FOR_PIXELS"]:
+                initializer = nn.initializers.xavier_uniform()
+
+                x = x.astype(jnp.float32) / 255.0
+                x = nn.Conv(
+                    features=32, kernel_size=(8, 8), strides=(4, 4), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                    features=64, kernel_size=(4, 4), strides=(2, 2), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                    features=64, kernel_size=(3, 3), strides=(1, 1), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = x.reshape(B, -1)
+            else:
+                x = x.reshape(B, -1)
+
             # dummy normalize input for global compatibility
             x_dummy = BatchRenorm(use_running_average=not train)(x)
+        else:
+            if self.norm_input:
+                x = BatchRenorm(use_running_average=not train)(x)
+            else:
+                # dummy normalize input for global compatibility
+                x_dummy = BatchRenorm(use_running_average=not train)(x)
 
         if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
+            def normalize(x): return nn.LayerNorm()(x)
         elif self.norm_type == "batch_norm":
-            normalize = lambda x: BatchRenorm(use_running_average=not train)(x)
+            def normalize(x): return BatchRenorm(
+                use_running_average=not train)(x)
         else:
-            normalize = lambda x: x
+            def normalize(x): return x
 
         for l in range(self.num_layers):
             x = nn.Dense(self.hidden_size)(x)
@@ -61,8 +88,10 @@ class QNetworkPerm(nn.Module):
 
         return x
 
+
 class QNetwork(nn.Module):
     action_dim: int
+    config: dict
     hidden_size: int = 512
     num_layers: int = 4
     norm_type: str = "batch_norm"
@@ -70,18 +99,45 @@ class QNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_input:
-            x = BatchRenorm(use_running_average=not train)(x)
-        else:
+        if "Pixels" in self.config["ENV_NAME"]:
+            B, H, W, C = x.shape
+
+            if self.config["USE_CONV_FOR_PIXELS"]:
+                initializer = nn.initializers.xavier_uniform()
+
+                x = x.astype(jnp.float32) / 255.0
+                x = nn.Conv(
+                    features=32, kernel_size=(8, 8), strides=(4, 4), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                    features=64, kernel_size=(4, 4), strides=(2, 2), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                    features=64, kernel_size=(3, 3), strides=(1, 1), kernel_init=initializer
+                )(x)
+                x = nn.relu(x)
+                x = x.reshape(B, -1)
+            else:
+                x = x.reshape(B, -1)
+
             # dummy normalize input for global compatibility
             x_dummy = BatchRenorm(use_running_average=not train)(x)
+        else:
+            if self.norm_input:
+                x = BatchRenorm(use_running_average=not train)(x)
+            else:
+                # dummy normalize input for global compatibility
+                x_dummy = BatchRenorm(use_running_average=not train)(x)
 
         if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
+            def normalize(x): return nn.LayerNorm()(x)
         elif self.norm_type == "batch_norm":
-            normalize = lambda x: BatchRenorm(use_running_average=not train)(x)
+            def normalize(x): return BatchRenorm(
+                use_running_average=not train)(x)
         else:
-            normalize = lambda x: x
+            def normalize(x): return x
 
         for l in range(self.num_layers):
             x = nn.Dense(self.hidden_size)(x)
@@ -257,6 +313,7 @@ def make_train(config):
                 )
                 #TODO: Add q_perm values to the q_vals here.
                 if config["USE_PERM"]:
+                    print("Get here")
                     q_vals_perm = network_perm.apply(
                         {
                             "params": train_state_perm.params,
@@ -484,6 +541,7 @@ def make_train(config):
 
             #TODO: Train the perm network here over the same minibatches with a jax.lax.cond
             # UPDATE Perm Network
+            print("Get above _learn_epoch_perm")
             if config["USE_PERM"]:
                 def _learn_epoch_perm(carry, _):
                     train_state_perm, rng = carry
@@ -656,9 +714,6 @@ def single_run(config):
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[
-            alg_name.upper(),
-            env_name.upper(),
-            f"jax_{jax.__version__}",
         ],
         name=config.get("NAME", f'{config["ALG_NAME"]}_{config["ENV_NAME"]}'),
         config=config,
