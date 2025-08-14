@@ -20,6 +20,10 @@ GAMMA: 0.99
 Q_LAMBDA: False
 LAMBDA: 0
 USE_PERM: False
+USE_SOFT_MOE_MULTI_EXPERT: True
+EXPERT_OUTPUT_COMBINE_STRAT: 'softmax_over_n_meanpool'
+NUM_EXPERTS: 4
+FEATURES_FROM_PIXELS_STRAT: 'scaled_pixels'
 
 # env specific
 ENV_NAME: "Craftax-Classic-Symbolic-v1"
