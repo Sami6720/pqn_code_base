@@ -32,6 +32,7 @@ from purejaxql.utils.batch_renorm import BatchRenorm
 
 class QNetwork(nn.Module):
     action_dim: int
+    config: dict
     hidden_size: int = 512
     num_layers: int = 4
     norm_type: str = "batch_norm"
@@ -39,11 +40,37 @@ class QNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
-        if self.norm_input:
-            x = BatchRenorm(use_running_average=not train)(x)
-        else:
+        if "Pixels" in self.config["ENV_NAME"]:
+            B, H, W, C = x.shape
+
+            if self.config["USE_CONV_FOR_PIXELS"]:
+                initializer = nn.initializers.xavier_uniform()
+
+                x = x.astype(jnp.float32) / 255.0
+                x = nn.Conv(
+                            features=32, kernel_size=(8, 8), strides=(4, 4), kernel_init=initializer
+                            )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                            features=64, kernel_size=(4, 4), strides=(2, 2), kernel_init=initializer
+                            )(x)
+                x = nn.relu(x)
+                x = nn.Conv(
+                            features=64, kernel_size=(3, 3), strides=(1, 1), kernel_init=initializer
+                            )(x)
+                x = nn.relu(x)
+                x = x.reshape(B, -1)
+            else:
+                x = x.reshape(B, -1)
+
             # dummy normalize input for global compatibility
             x_dummy = BatchRenorm(use_running_average=not train)(x)
+        else:
+            if self.norm_input:
+                x = BatchRenorm(use_running_average=not train)(x)
+            else:
+                # dummy normalize input for global compatibility
+                x_dummy = BatchRenorm(use_running_average=not train)(x)
 
         if self.norm_type == "layer_norm":
             normalize = lambda x: nn.LayerNorm()(x)
@@ -155,6 +182,7 @@ def make_train(config):
             num_layers=config.get("NUM_LAYERS", 2),
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
+            config=config
         )
 
         def create_agent(rng):
