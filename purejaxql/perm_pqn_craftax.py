@@ -31,11 +31,11 @@ from purejaxql.utils.batch_renorm import BatchRenorm
 
 class QNetworkPerm(nn.Module):
     action_dim: int
+    config: dict
     hidden_size: int = 512
     num_layers: int = 4
     norm_type: str = "batch_norm"
     norm_input: bool = False
-    config: dict
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
@@ -405,9 +405,13 @@ def make_train(config):
 
                         return loss, (updates, chosen_action_qvals)
 
+                    if config["USE_PERM"]:
+                        perm_params = train_state_perm.params
+                    else:
+                        perm_params = None
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
-                    )(train_state.params, train_state_perm.params)
+                    )(train_state.params, perm_params)
                     train_state = train_state.apply_gradients(grads=grads)
                     train_state = train_state.replace(
                         grad_steps=train_state.grad_steps + 1,
@@ -569,18 +573,17 @@ def make_train(config):
                     if (
                         metrics["update_steps"] % config.get("WANDB_LOG_INTERVAL", 128) == 0
                     ):
+                        us = metrics["update_steps"]
                         if config.get("WANDB_LOG_ALL_SEEDS", False):
-                            metrics.update(
-                                {
+                            metrics = {
                                     f"rng{int(original_rng)}/{k}": v
                                     for k, v in metrics.items()
                                 }
-                            )
-                        wandb.log(metrics, step=metrics["update_steps"])
+                        wandb.log(metrics, step=us)
 
                 jax.debug.callback(callback, metrics, original_rng)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+            runner_state = (train_state, train_state_perm, tuple(expl_state), test_metrics, rng)
 
             return runner_state, metrics
 
