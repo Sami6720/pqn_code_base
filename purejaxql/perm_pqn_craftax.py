@@ -52,6 +52,9 @@ class QNetworkPerm(nn.Module):
         if "Pixels" in self.config["ENV_NAME"]:
             B, H, W, C = x.shape
 
+            # dummy normalize input for global compatibility
+            x_dummy = BatchRenorm(use_running_average=not train)(x)
+
             if self.config["FEATURES_FROM_PIXELS_STRAT"] == 'conv':
                 initializer = nn.initializers.xavier_uniform()
 
@@ -125,8 +128,6 @@ class QNetworkPerm(nn.Module):
                     return x
                 else:
                     raise ValueError("Incorrect EXPERT_OUTPUT_COMBINE_STRAT")
-            # dummy normalize input for global compatibility
-            x_dummy = BatchRenorm(use_running_average=not train)(x)
         else:
             if self.norm_input:
                 x = BatchRenorm(use_running_average=not train)(x)
@@ -157,7 +158,7 @@ class QNetwork(nn.Module):
         if "Pixels" in self.config["ENV_NAME"]:
             B, H, W, C = x.shape
 
-            if self.config["USE_CONV_FOR_PIXELS"]:
+            if self.config["USE_CONV_FOR_PIXELS_TRANSIENT"]:
                 initializer = nn.initializers.xavier_uniform()
 
                 x = x.astype(jnp.float32) / 255.0
@@ -212,6 +213,7 @@ class Transition:
     done: chex.Array
     next_obs: chex.Array
     q_val: chex.Array
+    old_p_val: chex.Array
 
 
 class CustomTrainState(TrainState):
@@ -297,6 +299,7 @@ def make_train(config):
             num_layers=config.get("NUM_LAYERS", 2),
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
+            config=config
         )
 
         network_perm = QNetworkPerm(
@@ -338,7 +341,7 @@ def make_train(config):
                 )
 
                 train_state = CustomTrainState.create(
-                    apply_fn=network.apply,
+                    apply_fn=network_perm.apply,
                     params=network_variables["params"],
                     batch_stats=network_variables["batch_stats"],
                     tx=tx,
@@ -379,6 +382,8 @@ def make_train(config):
                     )
 
                     q_vals += q_vals_perm
+                else:
+                    q_vals_perm = jnp.zeros((config["NUM_ENVS"], env.action_space(env_params).n))
 
                 # different eps for each env
                 _rngs = jax.random.split(rng_a, config["NUM_ENVS"])
@@ -396,6 +401,7 @@ def make_train(config):
                     done=new_done,
                     next_obs=new_obs,
                     q_val=q_vals,
+                    old_p_val=q_vals_perm
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
@@ -487,7 +493,7 @@ def make_train(config):
 
                             #TODO: Need to add q_perm to both. Like an all_q_vals_perm
                             if config["USE_PERM"]:
-                                all_q_vals_perm = network.apply(
+                                all_q_vals_perm = network_perm.apply(
                                     {
                                         "params": params_perm,
                                         "batch_stats": train_state_perm.batch_stats,
@@ -623,7 +629,7 @@ def make_train(config):
                             q_vals_trans = network.apply(
                                     {
                                     "params": params_trans,
-                                    "batch_stats": train_state_perm.batch_stats
+                                    "batch_stats": train_state.batch_stats
                                     },
                                 minibatch.obs,
                                 train=False
@@ -633,8 +639,15 @@ def make_train(config):
                                 jnp.expand_dims(minibatch.action, axis=-1),
                                 axis=-1,
                             ).squeeze(axis=-1)
+                            old_p_val = jnp.take_along_axis(
+                                minibatch.old_p_val,
+                                jnp.expand_dims(minibatch.action, axis=-1),
+                                axis=-1,
+                            ).squeeze(axis=-1)
 
-                            loss = 0.5 * jnp.square(q_vals_perm - q_vals_trans).mean()
+                            target = jax.lax.stop_gradient(q_vals_trans + old_p_val)
+
+                            loss = 0.5 * jnp.square(target - q_vals_perm).mean()
                             return loss, updates_perm
 
                         (loss_perm, updates_perm), grads = jax.value_and_grad(
@@ -673,9 +686,22 @@ def make_train(config):
                     return (train_state_perm, rng), loss
 
                 rng, _rng = jax.random.split(rng)
-                (train_state_perm, rng), loss_perm = jax.lax.scan(
-                    _learn_epoch_perm, (train_state_perm, rng), None, config["NUM_EPOCHS"]
+                is_perm_learn_time = (
+                    train_state.n_updates % config["PERM_UPDATE_FREQ"]
                 )
+                dummy_loss = jnp.zeros(
+                    (config["NUM_EPOCHS"], config["NUM_MINIBATCHES"]))
+                (train_state_perm, rng), loss_perm = jax.lax.cond(
+                    is_perm_learn_time,
+                    lambda train_state_perm, rng: jax.lax.scan(
+                        _learn_epoch_perm, (train_state_perm,
+                                            rng), None, config["NUM_EPOCHS"]
+                    ),
+                    lambda train_state_perm, rng: ((train_state_perm, rng), dummy_loss),
+                    train_state_perm,
+                    _rng
+                )
+
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
