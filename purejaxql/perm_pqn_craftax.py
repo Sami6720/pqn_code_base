@@ -701,7 +701,7 @@ def make_train(config):
 
                 rng, _rng = jax.random.split(rng)
                 is_perm_learn_time = (
-                    train_state.n_updates % config["PERM_UPDATE_FREQ"]
+                    train_state.n_updates % config["PERM_UPDATE_FREQ"] == 0
                 )
                 dummy_loss = jnp.zeros(
                     (config["NUM_EPOCHS"], config["NUM_MINIBATCHES"]))
