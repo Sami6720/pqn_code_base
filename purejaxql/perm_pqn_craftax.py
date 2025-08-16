@@ -335,6 +335,14 @@ def make_train(config):
             def create_agent_perm(rng):
                 init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
                 network_variables = network_perm.init(rng, init_x, train=False)
+                lr_scheduler = optax.linear_schedule(
+                    init_value=config["LR_PERM"],
+                    end_value=1e-21,
+                    transition_steps=(config["NUM_UPDATES_DECAY"])
+                    * config["NUM_MINIBATCHES"]
+                    * config["NUM_EPOCHS"],
+                )
+                lr = lr_scheduler if config.get("LR_PERM_LINEAR_DECAY", False) else config["LR"]
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                     optax.radam(learning_rate=lr),
