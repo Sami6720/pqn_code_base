@@ -605,7 +605,7 @@ def make_train(config):
             print("Get above _learn_epoch_perm")
             if config["USE_PERM"]:
                 def _learn_epoch_perm(carry, _):
-                    train_state_perm, rng = carry
+                    train_state_perm, train_state, rng = carry
                     def _learn_phase_perm(carry, minibatch_and_target):
 
                         train_state_perm, rng = carry
@@ -683,7 +683,13 @@ def make_train(config):
                         _learn_phase_perm, (train_state_perm, rng), (minibatches, targets)
                     )
 
-                    return (train_state_perm, rng), loss
+                    # Soft-reset transient. Keeping the transient-weight the same across the minibatches so only resetting at end of epoch.
+                    train_state = train_state.replace(
+                        params=jax.tree_map(
+                            lambda x: (config["TRANSIENT_WEIGHT_DECAY"] ** (train_state_perm.n_updates)) *  x, train_state.params
+                        ))
+
+                    return (train_state_perm, train_state, rng), loss
 
                 rng, _rng = jax.random.split(rng)
                 is_perm_learn_time = (
@@ -691,14 +697,15 @@ def make_train(config):
                 )
                 dummy_loss = jnp.zeros(
                     (config["NUM_EPOCHS"], config["NUM_MINIBATCHES"]))
-                (train_state_perm, rng), loss_perm = jax.lax.cond(
+                (train_state_perm, train_state, rng), loss_perm = jax.lax.cond(
                     is_perm_learn_time,
-                    lambda train_state_perm, rng: jax.lax.scan(
-                        _learn_epoch_perm, (train_state_perm,
+                    lambda train_state_perm, train_state, rng: jax.lax.scan(
+                        _learn_epoch_perm, (train_state_perm, train_state,
                                             rng), None, config["NUM_EPOCHS"]
                     ),
-                    lambda train_state_perm, rng: ((train_state_perm, rng), dummy_loss),
+                    lambda train_state_perm, train_state, rng: ((train_state_perm, train_state, rng), dummy_loss),
                     train_state_perm,
+                    train_state,
                     _rng
                 )
 
