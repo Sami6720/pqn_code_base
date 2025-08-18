@@ -295,6 +295,9 @@ class QNetwork(nn.Module):
                     x = jnp.einsum("bnpd,bmnp->bmd", y_tilda, combine)
                     x = nn.Dense(self.action_dim)(x.reshape(B, -1))
                     return x
+            else:
+                # Flatten the output from encoder if not using soft-moe.
+                x = x.reshape(B, -1)
         else:
             if self.norm_input:
                 x = BatchRenorm(use_running_average=not train)(x)
