@@ -729,10 +729,12 @@ def make_train(config):
                     ):
                         us = metrics["update_steps"]
                         if config.get("WANDB_LOG_ALL_SEEDS", False):
+                            old_env_steps = metrics["env_step"]
                             metrics = {
                                     f"rng{int(original_rng)}/{k}": v
                                     for k, v in metrics.items()
                                 }
+                            metrics["env_step"] = old_env_steps
                         wandb.log(metrics, step=us)
 
                 jax.debug.callback(callback, metrics, original_rng)
