@@ -86,48 +86,74 @@ class QNetworkPerm(nn.Module):
 
                 assert 'flattened' not in self.config["FEATURES_FROM_PIXELS_STRAT"]
 
-                B, H, W, D = x.shape
-                print("Debug print x.shape after conv", x.shape)
-                #TOKENIZE PerConv
-                x = x.reshape(B, -1, D) # Shape (H*W) X D
-                # Let M = H * W
-                NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
-                phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
-                logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
+                if self.config["SOFT_MOE_APPR"] == 'ours':
+                    B, H, W, D = x.shape
+                    print("Debug print x.shape after conv", x.shape)
+                    #TOKENIZE PerConv
+                    x = x.reshape(B, -1, D) # Shape (H*W) X D
+                    # Let M = H * W
+                    NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
+                    phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
+                    logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
 
-                dispatch = jax.nn.softmax(logits, axis=1)
-                combine_per_expert = jax.nn.softmax(logits, axis=-1)
+                    dispatch = jax.nn.softmax(logits, axis=1)
+                    combine_per_expert = jax.nn.softmax(logits, axis=-1)
 
-                x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
+                    x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
 
-                stack = []
-                for i in range(self.config["NUM_EXPERTS"]):
-                    expert_out = x_tilda[:, i, :, :]
-                    for i in range(self.num_layers):
-                        expert_out = nn.Dense(D)(expert_out)
-                        expert_out = normalize(expert_out)
-                        expert_out = nn.relu(expert_out)
-                    stack.append(expert_out)
-                y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
+                    stack = []
+                    for i in range(self.config["NUM_EXPERTS"]):
+                        expert_out = x_tilda[:, i, :, :]
+                        for i in range(self.num_layers):
+                            expert_out = nn.Dense(D)(expert_out)
+                            expert_out = normalize(expert_out)
+                            expert_out = nn.relu(expert_out)
+                        stack.append(expert_out)
+                    y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
 
-                stack = []
-                y_tilda_tilda = jnp.einsum('bnpd,bmnp->bnmd', y_tilda, combine_per_expert)
-                # Output layer: one Q-value per action per expert
-                for i in range(self.config["NUM_EXPERTS"]):
-                    # The input is a vector of shape M * D into the Q-value head
-                    expert_perm_q_val = nn.Dense(self.action_dim)(y_tilda_tilda[:, i, :, :].reshape(B, -1))
-                    stack.append(expert_perm_q_val)
-                y = jnp.stack(stack, axis=1) # BNA
+                    stack = []
+                    y_tilda_tilda = jnp.einsum('bnpd,bmnp->bnmd', y_tilda, combine_per_expert)
+                    # Output layer: one Q-value per action per expert
+                    for i in range(self.config["NUM_EXPERTS"]):
+                        # The input is a vector of shape M * D into the Q-value head
+                        expert_perm_q_val = nn.Dense(self.action_dim)(y_tilda_tilda[:, i, :, :].reshape(B, -1))
+                        stack.append(expert_perm_q_val)
+                    y = jnp.stack(stack, axis=1) # BNA
 
-                if self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == 'sum':
-                    x = jnp.sum(y, axis=1)
+                    if self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == 'sum':
+                        x = jnp.sum(y, axis=1)
+                        return x
+                    elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "softmax_over_n_meanpool":
+                        combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3)), axis=1) # BN
+                        x = jnp.einsum("bn,bna->ba", combine_q_vectors, y)
+                        return x
+                    else:
+                        raise ValueError("Incorrect EXPERT_OUTPUT_COMBINE_STRAT")
+                elif self.config['SOFT_MOE_APPR'] == 'big':
+                #NOTE: Big arch since in Mixture of Experts in Mixtures of RL this it worked the best.
+                    # Let M = H * W
+                    NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
+                    phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
+                    logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
+
+                    dispatch = jax.nn.softmax(logits, axis=1)
+                    combine = jax.nn.softmax(logits, axis=(2, 3))
+
+                    x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
+
+                    stack = []
+                    for i in range(self.config["NUM_EXPERTS"]):
+                        expert_out = x_tilda[:, i, :, :]
+                        for i in range(self.num_layers):
+                            expert_out = nn.Dense(D)(expert_out)
+                            expert_out = normalize(expert_out)
+                            expert_out = nn.relu(expert_out)
+                        stack.append(expert_out)
+                    y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
+
+                    x = jnp.einsum("bnpd,bmnp->bmd", y_tilda, combine)
+                    x = nn.Dense(self.action_dim)(x.reshape(B, -1))
                     return x
-                elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "softmax_over_n_meanpool":
-                    combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3)), axis=1) # BN
-                    x = jnp.einsum("bn,bna->ba", combine_q_vectors, y)
-                    return x
-                else:
-                    raise ValueError("Incorrect EXPERT_OUTPUT_COMBINE_STRAT")
         else:
             if self.norm_input:
                 x = BatchRenorm(use_running_average=not train)(x)
@@ -338,6 +364,7 @@ def make_train(config):
                 lr_scheduler = optax.linear_schedule(
                     init_value=config["LR_PERM"],
                     end_value=1e-21,
+                    #TODO: Maybe transition_steps needs to change?
                     transition_steps=(config["NUM_UPDATES_DECAY"])
                     * config["NUM_MINIBATCHES"]
                     * config["NUM_EPOCHS"],
