@@ -929,6 +929,13 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
 
+    submodule_path = "pqn_code_base"
+    import subprocess
+    commit_hash = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=submodule_path
+    ).decode("utf-8").strip()
+    wandb.config.update({"submodule_commit": commit_hash})
+
     rng = jax.random.PRNGKey(config["SEED"])
 
     t0 = time.time()
