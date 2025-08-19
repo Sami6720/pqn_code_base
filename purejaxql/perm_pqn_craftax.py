@@ -6,6 +6,7 @@ import copy
 import os
 import time
 import jax
+import flax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
@@ -803,12 +804,57 @@ def make_train(config):
                     )
 
                     # Soft-reset transient. Keeping the transient-weight the same across the minibatches so only resetting at end of epoch.
-                    train_state = train_state.replace(
-                        params=jax.tree_map(
-                            lambda x: (config["TRANSIENT_WEIGHT_DECAY"] ** (train_state_perm.n_updates)) *  x, train_state.params
-                        ))
+                    def reset_transient(train_state_trans, rng):
+
+
+                        if config['TRANS_WEIGHT_RESET_STRATEGY'] == 'exp':
+                            temp_train_state = train_state_trans.replace(
+                                params=jax.tree_map(
+                                    lambda x: (config["TRANSIENT_WEIGHT_DECAY"] ** (train_state_perm.n_updates)) *  x, train_state_trans.params
+                                ))
+                        elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'multiplicative':
+                            temp_train_state = train_state_trans.replace(
+                                params=jax.tree_map(
+                                    lambda x: config["TRANSIENT_WEIGHT_DECAY"] *  x, train_state_trans.params
+                                )
+                            )
+
+                        elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'reinit_action_heads':
+                            assert config["USE_SOFT_MOE_MULTI_EXPERT_TRANS"] == False 
+                            rng, _rng = jax.random.split(rng)
+                            def reinit_action_heads(ts, rng, dummy_input):
+                                # Get a fresh param tree for this module on the same input shape
+                                new_params_full = network.init(rng, dummy_input)
+                                # Splice only the head(s)
+                                flat_old = flax.traverse_util.flatten_dict(ts.params, sep="/")
+                                flat_new = flax.traverse_util.flatten_dict(new_params_full, sep="/")
+                                def is_head(k):
+                                    return 'action_head' in k
+                                for k in list(flat_old.keys()):
+                                    if is_head(k):
+                                        flat_old[k] = flat_new[k]
+
+
+                                return ts.replace(params=flax.traverse_util.unflatten_dict(flat_old, sep="/"))
+
+                            init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+                            temp_train_state = reinit_action_heads(train_state, _rng, init_x)
+                        else:
+                            raise ValueError("Wrong TRANS_WEIGHT_RESET_STRATEGY: ", config["TRANS_WEIGHT_RESET_STRATEGY"])
+
+                        return temp_train_state, rng
+
+                    should_reset = (train_state_perm.n_updates % config["TRANS_RESET_FREQ_EVERY_PERM_UPDATE"] == 0)
+                    modified_train_states_trans, rng = jax.lax.cond(
+                        should_reset,
+                        reset_transient,
+                        lambda train_states_trans, rng: (train_states_trans, rng),
+                       train_state,
+                        rng
+                    )
 
                     return (train_state_perm, train_state, rng), loss
+
 
                 rng, _rng = jax.random.split(rng)
                 is_perm_learn_time = (
