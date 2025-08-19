@@ -73,11 +73,11 @@ class QNetworkPerm(nn.Module):
                 )(x)
                 x = nn.relu(x)
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_pixels':
-                x = x.astype(jnp.uint32) / 255.0
+                x = x.astype(jnp.float32) / 255.0
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'flattened':
                 x = x.reshape(B, -1)
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_flattened':
-                x = x.astype(jnp.uint32) / 255.0
+                x = x.astype(jnp.float32) / 255.0
                 x = x.reshape(B, -1)
             else:
                 raise ValueError("Wrong way to generate feature from pixels")
@@ -214,11 +214,11 @@ class QNetwork(nn.Module):
                 )(x)
                 x = nn.relu(x)
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_pixels':
-                x = x.astype(jnp.uint32) / 255.0
+                x = x.astype(jnp.float32) / 255.0
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'flattened':
                 x = x.reshape(B, -1)
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_flattened':
-                x = x.astype(jnp.uint32) / 255.0
+                x = x.astype(jnp.float32) / 255.0
                 x = x.reshape(B, -1)
             else:
                 raise ValueError("Wrong way to generate feature from pixels")
