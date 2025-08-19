@@ -311,7 +311,7 @@ class QNetwork(nn.Module):
             x = normalize(x)
             x = nn.relu(x)
 
-        x = nn.Dense(self.action_dim)(x)
+        x = nn.Dense(self.action_dim, name='action_head')(x)
 
         return x
 
@@ -824,10 +824,14 @@ def make_train(config):
                             rng, _rng = jax.random.split(rng)
                             def reinit_action_heads(ts, rng, dummy_input):
                                 # Get a fresh param tree for this module on the same input shape
-                                new_params_full = network.init(rng, dummy_input)
+                                new_params_full = network.init(rng, dummy_input, train=False)['params']
                                 # Splice only the head(s)
                                 flat_old = flax.traverse_util.flatten_dict(ts.params, sep="/")
                                 flat_new = flax.traverse_util.flatten_dict(new_params_full, sep="/")
+                                # jax.debug.print("get here, {k}", k=flat_new.keys())
+                                # jax.debug.print("get here, old {k}", k=flat_old.keys())
+                                # print(f"get here, {flat_new.keys()}")
+                                # print(f"get here, old {flat_old.keys()}")
                                 def is_head(k):
                                     return 'action_head' in k
                                 for k in list(flat_old.keys()):
@@ -853,7 +857,7 @@ def make_train(config):
                         rng
                     )
 
-                    return (train_state_perm, train_state, rng), loss
+                    return (train_state_perm, modified_train_states_trans, rng), loss
 
 
                 rng, _rng = jax.random.split(rng)
@@ -872,6 +876,12 @@ def make_train(config):
                     train_state_perm,
                     train_state,
                     _rng
+                )
+                train_state_perm = jax.lax.cond(
+                    is_perm_learn_time,
+                    lambda ts: ts.replace(n_updates=ts.n_updates + 1),
+                    lambda ts: ts,
+                    train_state_perm
                 )
 
 
