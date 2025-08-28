@@ -463,7 +463,7 @@ def make_train(config):
                     * config["NUM_MINIBATCHES"]
                     * config["NUM_EPOCHS"],
                 )
-                lr = lr_scheduler if config.get("LR_PERM_LINEAR_DECAY", False) else config["LR"]
+                lr = lr_scheduler if config.get("LR_PERM_LINEAR_DECAY", False) else config["LR_PERM"]
                 tx = optax.chain(
                     optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                     optax.radam(learning_rate=lr),
