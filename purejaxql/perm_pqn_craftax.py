@@ -110,7 +110,10 @@ class QNetworkPerm(nn.Module):
                     for i in range(self.config["NUM_EXPERTS"]):
                         expert_out = x_tilda[:, i, :, :]
                         for i in range(self.num_layers):
-                            expert_out = nn.Dense(D)(expert_out)
+                            if i == (self.num_layers - 1):
+                                expert_out = nn.Dense(D)(expert_out)
+                            else:
+                                expert_out = nn.Dense(int(self.hidden_size * 0.88))(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
                         stack.append(expert_out)

@@ -84,7 +84,7 @@ class QNetwork(nn.Module):
             normalize = lambda x: x
 
         for l in range(self.num_layers):
-            x = nn.Dense(self.hidden_size)(x)
+            x = nn.Dense(int(self.hidden_size * 1.6))(x)
             x = normalize(x)
             x = nn.relu(x)
 
