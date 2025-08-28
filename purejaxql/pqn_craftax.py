@@ -30,6 +30,10 @@ from purejaxql.utils.craftax_wrappers import (
 from purejaxql.utils.batch_renorm import BatchRenorm
 
 
+def count_params(params: Any) -> int:
+    """Total number of scalars in a JAX/Flax params PyTree."""
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+
 class QNetwork(nn.Module):
     action_dim: int
     config: dict
@@ -203,6 +207,8 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
+
+        print(f"Network parameter count: {count_params(train_state.params)}")
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):

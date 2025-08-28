@@ -30,6 +30,10 @@ from purejaxql.utils.craftax_wrappers import (
 )
 from purejaxql.utils.batch_renorm import BatchRenorm
 
+def count_params(params: Any) -> int:
+    """Total number of scalars in a JAX/Flax params PyTree."""
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+
 class QNetworkPerm(nn.Module):
     action_dim: int
     config: dict
@@ -442,6 +446,8 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
 
+        print(f"Transient Network params count: {count_params(train_state.params)}")
+
         if config["USE_PERM"]:
             def create_agent_perm(rng):
                 init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
@@ -469,6 +475,8 @@ def make_train(config):
                 return train_state
             rng, _rng = jax.random.split(rng)
             train_state_perm = create_agent_perm(_rng)
+            print(f"Permanent Network params count: {count_params(train_state_perm.params)}")
+            print("Hidden size: ", network_perm.hidden_size)
         else:
             train_state_perm = None
 
