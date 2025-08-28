@@ -47,6 +47,7 @@ class QNetwork(nn.Module):
         if "Pixels" in self.config["ENV_NAME"]:
             B, H, W, C = x.shape
 
+            x_dummy = BatchRenorm(use_running_average=not train)(x)
             if self.config["USE_CONV_FOR_PIXELS"]:
                 initializer = nn.initializers.xavier_uniform()
 
@@ -67,8 +68,8 @@ class QNetwork(nn.Module):
             else:
                 x = x.reshape(B, -1)
 
-            # dummy normalize input for global compatibility
-            x_dummy = BatchRenorm(use_running_average=not train)(x)
+            # # dummy normalize input for global compatibility
+            # x_dummy = BatchRenorm(use_running_average=not train)(x)
         else:
             if self.norm_input:
                 x = BatchRenorm(use_running_average=not train)(x)
