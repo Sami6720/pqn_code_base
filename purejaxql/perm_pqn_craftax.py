@@ -87,11 +87,11 @@ class QNetworkPerm(nn.Module):
 
                 assert 'flattened' not in self.config["FEATURES_FROM_PIXELS_STRAT"]
 
+                B, H, W, D = x.shape
+                #TOKENIZE PerConv
+                x = x.reshape(B, -1, D) # Shape (H*W) X D
                 if self.config["SOFT_MOE_APPR"] == 'ours':
-                    B, H, W, D = x.shape
                     print("Debug print x.shape after conv", x.shape)
-                    #TOKENIZE PerConv
-                    x = x.reshape(B, -1, D) # Shape (H*W) X D
                     # Let M = H * W
                     NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
                     phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
