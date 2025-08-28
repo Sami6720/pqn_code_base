@@ -109,8 +109,8 @@ class QNetworkPerm(nn.Module):
                     stack = []
                     for i in range(self.config["NUM_EXPERTS"]):
                         expert_out = x_tilda[:, i, :, :]
-                        for i in range(self.num_layers):
-                            if i == (self.num_layers - 1):
+                        for j in range(self.num_layers):
+                            if j == (self.num_layers - 1):
                                 expert_out = nn.Dense(D)(expert_out)
                             else:
                                 expert_out = nn.Dense(int(self.hidden_size * 0.88))(expert_out)
@@ -152,7 +152,7 @@ class QNetworkPerm(nn.Module):
                     stack = []
                     for i in range(self.config["NUM_EXPERTS"]):
                         expert_out = x_tilda[:, i, :, :]
-                        for i in range(self.num_layers):
+                        for j in range(self.num_layers):
                             expert_out = nn.Dense(D)(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
@@ -162,6 +162,11 @@ class QNetworkPerm(nn.Module):
                     x = jnp.einsum("bnpd,bmnp->bmd", y_tilda, combine)
                     x = nn.Dense(self.action_dim)(x.reshape(B, -1))
                     return x
+                else:
+                    raise ValueError("Incorrect SOFT_MOE_APPR: ", self.config["SOFT_MOE_APPR"])
+            else:
+                # Flatten the output from encoder if not using soft-moe.
+                x = x.reshape(B, -1)
         else:
             if self.norm_input:
                 x = BatchRenorm(use_running_average=not train)(x)
@@ -235,11 +240,12 @@ class QNetwork(nn.Module):
 
                 assert 'flattened' not in self.config["FEATURES_FROM_PIXELS_STRAT"]
 
+                B, H, W, D = x.shape
+                print("Debug print x.shape after conv", x.shape)
+                #TOKENIZE PerConv
+                x = x.reshape(B, -1, D) # Shape (H*W) X D
+
                 if self.config["SOFT_MOE_APPR_TRANS"] == 'ours':
-                    B, H, W, D = x.shape
-                    print("Debug print x.shape after conv", x.shape)
-                    #TOKENIZE PerConv
-                    x = x.reshape(B, -1, D) # Shape (H*W) X D
                     # Let M = H * W
                     NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
                     phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
@@ -253,7 +259,7 @@ class QNetwork(nn.Module):
                     stack = []
                     for i in range(self.config["NUM_EXPERTS"]):
                         expert_out = x_tilda[:, i, :, :]
-                        for i in range(self.num_layers):
+                        for j in range(self.num_layers):
                             expert_out = nn.Dense(D)(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
@@ -293,7 +299,7 @@ class QNetwork(nn.Module):
                     stack = []
                     for i in range(self.config["NUM_EXPERTS"]):
                         expert_out = x_tilda[:, i, :, :]
-                        for i in range(self.num_layers):
+                        for j in range(self.num_layers):
                             expert_out = nn.Dense(D)(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
