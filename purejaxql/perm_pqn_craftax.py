@@ -30,6 +30,11 @@ from purejaxql.utils.craftax_wrappers import (
 )
 from purejaxql.utils.batch_renorm import BatchRenorm
 
+from analysis_helpers import (
+    effective_rank, effective_rank_per_expert, ntk_srank, dormant_fraction,
+    routing_utilization, expert_dormant_fraction, phi_norms, q_stats,
+)
+
 def count_params(params: Any) -> int:
     """Total number of scalars in a JAX/Flax params PyTree."""
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
@@ -45,6 +50,8 @@ class QNetworkPerm(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
 
+        # >>> CHANGE: enable/disable instrumentation from config
+        log_int = self.config.get("LOG_INTERNALS", False)  # when True we sow() intermediates
 
         if self.norm_type == "layer_norm":
             def normalize(x): return nn.LayerNorm()(x)
@@ -76,6 +83,12 @@ class QNetworkPerm(nn.Module):
                     features=64, kernel_size=(3, 3), strides=(1, 1), kernel_init=initializer
                 )(x)
                 x = nn.relu(x)
+
+                # >>> CHANGE: expose CNN output (for dormant-neuron on encoder)
+                if log_int:
+                    self.sow('intermediates', 'cnn_out', x)
+
+
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_pixels':
                 x = x.astype(jnp.float32) / 255.0
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'flattened':
@@ -104,6 +117,12 @@ class QNetworkPerm(nn.Module):
                     dispatch = jax.nn.softmax(logits, axis=1)
                     combine_per_expert = jax.nn.softmax(logits, axis=-1)
 
+                    # >>> CHANGE: expose MoE internals for permanent net
+                    if log_int:
+                        self.sow('intermediates', 'perm_logits', logits)
+                        self.sow('intermediates', 'perm_dispatch', dispatch)
+                        self.sow('intermediates', 'perm_combine_per_expert', combine_per_expert)
+
                     x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
 
                     stack = []
@@ -117,16 +136,24 @@ class QNetworkPerm(nn.Module):
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
                         stack.append(expert_out)
+
                     y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
+                    y_tilda_tilda = jnp.einsum('bnpd,bmnp->bnmd', y_tilda, combine_per_expert)
+                    # >>> CHANGE: expose per-expert features (for per-expert effective rank)
+                    if log_int:
+                        self.sow('intermediates', 'perm_y_tilda_tilda', y_tilda_tilda)
 
                     stack = []
-                    y_tilda_tilda = jnp.einsum('bnpd,bmnp->bnmd', y_tilda, combine_per_expert)
                     # Output layer: one Q-value per action per expert
                     for i in range(self.config["NUM_EXPERTS"]):
                         # The input is a vector of shape M * D into the Q-value head
                         expert_perm_q_val = nn.Dense(self.action_dim)(y_tilda_tilda[:, i, :, :].reshape(B, -1))
                         stack.append(expert_perm_q_val)
                     y = jnp.stack(stack, axis=1) # BNA
+
+                    # >>> CHANGE: expose per-expert Qs
+                    if log_int:
+                        self.sow('intermediates', 'perm_qs_per_expert', y)
 
                     if self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == 'sum':
                         x = jnp.sum(y, axis=1)
@@ -182,6 +209,10 @@ class QNetworkPerm(nn.Module):
             x = normalize(x)
             x = nn.relu(x)
 
+        # >>> CHANGE: expose last hidden before action head (even if you won't use full-module feature rank)
+        if log_int:
+            self.sow('intermediates', 'last_hidden', x)
+
         x = nn.Dense(self.action_dim)(x)
 
         return x
@@ -197,6 +228,8 @@ class QNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
+
+        log_int = self.config.get("LOG_INTERNALS", False)  # when True we sow() intermediates
 
         if self.norm_type == "layer_norm":
             def normalize(x): return nn.LayerNorm()(x)
@@ -228,6 +261,11 @@ class QNetwork(nn.Module):
                     features=64, kernel_size=(3, 3), strides=(1, 1), kernel_init=initializer
                 )(x)
                 x = nn.relu(x)
+
+                # >>> CHANGE: expose CNN output (for dormant-neuron on encoder)
+                if log_int:
+                    self.sow('intermediates', 'cnn_out', x)
+
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'scaled_pixels':
                 x = x.astype(jnp.float32) / 255.0
             elif self.config["FEATURES_FROM_PIXELS_STRAT"] == 'flattened':
@@ -257,6 +295,12 @@ class QNetwork(nn.Module):
                     dispatch = jax.nn.softmax(logits, axis=1)
                     combine_per_expert = jax.nn.softmax(logits, axis=-1)
 
+                    # >>> CHANGE: expose MoE internals for permanent net
+                    if log_int:
+                        self.sow('intermediates', 'perm_logits', logits)
+                        self.sow('intermediates', 'perm_dispatch', dispatch)
+                        self.sow('intermediates', 'perm_combine_per_expert', combine_per_expert)
+
                     x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
 
                     stack = []
@@ -272,6 +316,11 @@ class QNetwork(nn.Module):
                     stack = []
                     y_tilda_tilda = jnp.einsum('bnpd,bmnp->bnmd', y_tilda, combine_per_expert)
                     # Output layer: one Q-value per action per expert
+
+                    # >>> CHANGE: expose per-expert features (for per-expert effective rank)
+                    if log_int:
+                        self.sow('intermediates', 'perm_y_tilda_tilda', y_tilda_tilda)
+
                     for i in range(self.config["NUM_EXPERTS"]):
                         # The input is a vector of shape M * D into the Q-value head
                         expert_perm_q_val = nn.Dense(self.action_dim)(y_tilda_tilda[:, i, :, :].reshape(B, -1))
@@ -326,6 +375,11 @@ class QNetwork(nn.Module):
             x = nn.Dense(self.hidden_size)(x)
             x = normalize(x)
             x = nn.relu(x)
+
+        # >>> CHANGE: expose last hidden before action head (even if you won't use full-module feature rank)
+        if log_int:
+            self.sow('intermediates', 'last_hidden', x)
+
 
         x = nn.Dense(self.action_dim, name='action_head')(x)
 
@@ -908,6 +962,225 @@ def make_train(config):
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
 
+                # ===== Analysis knobs =====
+                ANALYSIS_INTERVAL = int(config.get("ANALYSIS_INTERVAL", 10))
+                ANALYSIS_BATCH    = int(config.get("ANALYSIS_BATCH", 64))
+                SRANK_DELTA       = float(config.get("SRANK_DELTA", 0.01))
+                DORMANT_TAU       = float(config.get("DORMANT_TAU", 0.05))
+                EXPERT_TAU        = float(config.get("EXPERT_TAU", 1e-3))
+                LOG_INTERNALS     = bool(config.get("LOG_INTERNALS", True))
+
+                import flax
+                from flax import traverse_util
+
+                # ----- util: ensure every metric is float32 to satisfy lax.cond type equality -----
+                def _f32(x):
+                    return jnp.asarray(x, jnp.float32)
+
+                # ----- util: param mask for "exclude CNN" NTK -----
+                def _mask_excl_cnn(key: str) -> bool:
+                    return ("Conv" not in key)
+
+                # ----- util: sample a small batch from transitions for analysis -----
+                def _sample_obs_for_analysis(transitions, rng):
+                    obs = transitions.obs.reshape(-1, *transitions.obs.shape[2:])
+                    n = obs.shape[0]
+                    if n > ANALYSIS_BATCH:
+                        idx = jax.random.choice(rng, n, (ANALYSIS_BATCH,), replace=False)
+                        obs = obs[idx]
+                    return obs
+
+                # ----- SAFE accessors for intermediates (handle missing keys & tuples) -----
+                def _get_intermediates(coll):
+                    if isinstance(coll, (dict, flax.core.FrozenDict)):
+                        return coll.get('intermediates', {})
+                    return {}
+
+                def _as_array(v):
+                    if isinstance(v, (list, tuple)):
+                        if not v:
+                            return None
+                        v = v[-1]
+                    try:
+                        return jnp.asarray(v)
+                    except Exception:
+                        return None
+
+                def _last_sown(inter_dict, name: str):
+                    if not isinstance(inter_dict, (dict, flax.core.FrozenDict)):
+                        return None
+                    flat = traverse_util.flatten_dict(inter_dict, sep='/')  # "Module/.../name"
+                    candidates = []
+                    for k, v in flat.items():
+                        if isinstance(k, str) and (k.endswith('/' + name) or k == name):
+                            vv = _as_array(v)
+                            if vv is not None:
+                                candidates.append(vv)
+                    if not candidates:
+                        return None
+                    return candidates[-1]
+
+                # ----- build NaN metrics WITHOUT doing heavy work in the false branch -----
+                def _empty_analysis_metrics():
+                    nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+                    return {
+                        # transient
+                        "trans/feat_srank": nan,
+                        "trans/cnn_dormant_frac": nan,
+                        "trans/ntk_srank_incl_cnn": nan,
+                        "trans/ntk_srank_excl_cnn": nan,
+                        "trans/qnorm": nan,
+                        "trans/qvar_actions": nan,
+                        "trans/qvar_batch": nan,
+                        # permanent (overall)
+                        "perm/feat_srank_per_expert_mean": nan,
+                        "perm/cnn_dormant_frac": nan,
+                        "perm/ntk_srank_incl_cnn": nan,
+                        "perm/ntk_srank_excl_cnn": nan,
+                        "perm/qnorm": nan,
+                        "perm/qvar_actions": nan,
+                        "perm/qvar_batch": nan,
+                        # permanent (per-expert Q functions)
+                        "perm/qnorm_per_expert_mean": nan,
+                        "perm/qvar_actions_per_expert_mean": nan,
+                        "perm/qvar_batch_per_expert_mean": nan,
+                        # MoE routing + phi
+                        "perm/dispatch_dormant_expert_frac": nan,
+                        "perm/dispatch_mean_mass_avg": nan,
+                        "perm/combine_dormant_expert_frac": nan,
+                        "perm/combine_mean_mass_avg": nan,
+                        "perm/phi_norm_global": nan,
+                    }
+
+                # ----- Core analysis (heavy path runs only at interval) -----
+                def _compute_analysis(train_state, train_state_perm, transitions, rng):
+                    out = _empty_analysis_metrics()  # correct structure & dtypes
+
+                    # sample a small batch
+                    rng, rng_idx = jax.random.split(rng)
+                    obs = _sample_obs_for_analysis(transitions, rng_idx)
+
+                    # -------- Transient (QNetwork) --------
+                    variables_t = {"params": train_state.params, "batch_stats": train_state.batch_stats}
+                    if LOG_INTERNALS:
+                        q_t, coll_t = network.apply(variables_t, obs, train=False, mutable=['intermediates'])
+                        inter_t = _get_intermediates(coll_t)
+                    else:
+                        q_t = network.apply(variables_t, obs, train=False)
+                        inter_t = {}
+
+                    # cnn_out dormant
+                    cnn_out_t = _last_sown(inter_t, 'cnn_out')
+                    if cnn_out_t is not None:
+                        out["trans/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_t, tau=DORMANT_TAU)[0])
+
+                    # last_hidden effective rank
+                    last_hidden_t = _last_sown(inter_t, 'last_hidden')
+                    if last_hidden_t is not None:
+                        out["trans/feat_srank"] = _f32(effective_rank(last_hidden_t, SRANK_DELTA))
+
+                    # NTK srank (incl/excl CNN)
+                    if config.get("ANALYZE_NTK", False):
+                        out["trans/ntk_srank_incl_cnn"] = _f32(ntk_srank(network.apply, variables_t, obs, delta=SRANK_DELTA))
+                        out["trans/ntk_srank_excl_cnn"] = _f32(ntk_srank(
+                            network.apply, variables_t, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
+                        ))
+
+                    # Q diagnostics
+                    qn_t, qvarA_t, qvarB_t = q_stats(q_t)
+                    out["trans/qnorm"] = _f32(qn_t)
+                    out["trans/qvar_actions"] = _f32(qvarA_t)
+                    out["trans/qvar_batch"] = _f32(qvarB_t)
+
+                    # -------- Permanent (QNetworkPerm) --------
+                    if config["USE_PERM"]:
+                        variables_p = {"params": train_state_perm.params, "batch_stats": train_state_perm.batch_stats}
+                        if LOG_INTERNALS:
+                            q_p, coll_p = network_perm.apply(variables_p, obs, train=False, mutable=['intermediates'])
+                            inter_p = _get_intermediates(coll_p)
+                        else:
+                            q_p = network_perm.apply(variables_p, obs, train=False)
+                            inter_p = {}
+
+                        # per-expert feature srank (NOT full-module rank)
+                        y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
+                        if y_tilda_tilda is not None:
+                            sranks = effective_rank_per_expert(y_tilda_tilda, delta=SRANK_DELTA)  # [N], float
+                            out["perm/feat_srank_per_expert_mean"] = _f32(jnp.mean(sranks))
+
+                        # CNN dormant (perm)
+                        cnn_out_p = _last_sown(inter_p, 'cnn_out')
+                        if cnn_out_p is not None:
+                            out["perm/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_p, tau=DORMANT_TAU)[0])
+
+                        # NTK srank (incl/excl CNN)
+                        if config.get("ANALYZE_NTK", False):
+                            out["perm/ntk_srank_incl_cnn"] = _f32(ntk_srank(network_perm.apply, variables_p, obs, delta=SRANK_DELTA))
+                            out["perm/ntk_srank_excl_cnn"] = _f32(ntk_srank(
+                                network_perm.apply, variables_p, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
+                            ))
+
+                        # Q diagnostics (overall permanent)
+                        qn_p, qvarA_p, qvarB_p = q_stats(q_p)
+                        out["perm/qnorm"] = _f32(qn_p)
+                        out["perm/qvar_actions"] = _f32(qvarA_p)
+                        out["perm/qvar_batch"] = _f32(qvarB_p)
+
+                        # Per-expert Q diagnostics
+                        q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
+                        if q_per_exp is not None:
+                            qn_e, qvarA_e, qvarB_e = q_stats(q_per_exp)
+                            out["perm/qnorm_per_expert_mean"] = _f32(qn_e)
+                            out["perm/qvar_actions_per_expert_mean"] = _f32(qvarA_e)
+                            out["perm/qvar_batch_per_expert_mean"] = _f32(qvarB_e)
+
+                        # MoE routing dormancy (dispatch & combine)
+                        dispatch = _last_sown(inter_p, 'perm_dispatch')
+                        if dispatch is not None:
+                            mass = routing_utilization(dispatch)
+                            out["perm/dispatch_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass, tau_exp=EXPERT_TAU))
+                            out["perm/dispatch_mean_mass_avg"] = _f32(jnp.mean(mass))
+
+                        comb_per_exp = _last_sown(inter_p, 'perm_combine_per_expert')
+                        comb = _last_sown(inter_p, 'perm_combine')
+                        _comb_to_use = comb_per_exp if comb_per_exp is not None else comb
+                        if _comb_to_use is not None:
+                            mass_c = routing_utilization(_comb_to_use)
+                            out["perm/combine_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass_c, tau_exp=EXPERT_TAU))
+                            out["perm/combine_mean_mass_avg"] = _f32(jnp.mean(mass_c))
+
+                        # phi norms (||phi||)
+                        phi = None
+                        flatp = traverse_util.flatten_dict(train_state_perm.params, sep='/')
+                        for k, v in flatp.items():
+                            if isinstance(k, str) and k.endswith('/phi'):
+                                phi = v
+                                break
+                        if phi is not None:
+                            phi_g, _, _ = phi_norms(phi)
+                            out["perm/phi_norm_global"] = _f32(phi_g)
+
+                    return out
+
+                # ===== Gate heavy analysis sparsely inside the JIT =====
+                us = metrics["update_steps"]
+                us0 = us if jnp.ndim(us) == 0 else us[0]   # keep predicate scalar
+                jax.debug.print("us0 {x}", x=us0)
+                do_analyze = (us0 % ANALYSIS_INTERVAL) == 0
+
+                analysis_metrics = jax.lax.cond(
+                    do_analyze,
+                    lambda _: _compute_analysis(
+                        train_state, train_state_perm, transitions,
+                        jax.random.fold_in(rng, us0)
+                    ),
+                    lambda _: _empty_analysis_metrics(),
+                    operand=None,
+                )
+
+                # merge into metrics pytree (structure stays constant across steps)
+                metrics = {**metrics, **analysis_metrics}
+
                 def callback(metrics, original_rng):
                     
                     # log at intervals 
@@ -915,6 +1188,7 @@ def make_train(config):
                         metrics["update_steps"] % config.get("WANDB_LOG_INTERVAL", 128) == 0
                     ):
                         us = metrics["update_steps"]
+                        to_log = {k: (float(v) if hasattr(v, "dtype") else v) for k, v in metrics.items()}
                         if config.get("WANDB_LOG_ALL_SEEDS", False):
                             old_env_steps = metrics["env_step"]
                             metrics = {
