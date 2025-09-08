@@ -560,6 +560,8 @@ def make_train(config):
 
             train_state, train_state_perm, expl_state, test_metrics, rng = runner_state
 
+            metrics = {}
+
             # SAMPLE PHASE
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
@@ -593,6 +595,18 @@ def make_train(config):
                 eps = jnp.full(config["NUM_ENVS"], eps_scheduler(train_state.n_updates))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
 
+                if config["USE_PERM"]:
+                    # Q from perm and total at the chosen action
+                    q_perm_sel  = jnp.take_along_axis(q_vals_perm, jnp.expand_dims(new_action, -1), axis=-1).squeeze(-1)  # [NUM_ENVS]
+                    q_total_sel = jnp.take_along_axis(q_vals, jnp.expand_dims(new_action, -1), axis=-1).squeeze(-1)  # [NUM_ENVS]
+
+                    eps_den = jnp.asarray(1e-8, q_total_sel.dtype)
+
+                    q_trans_sel = q_total_sel - q_perm_sel
+                    q_val_perm_proportion = jnp.abs(q_perm_sel) / (jnp.abs(q_perm_sel) + jnp.abs(q_trans_sel) + eps_den)
+                else:
+                    q_val_perm_proportion = jnp.zeros((config["NUM_ENVS"],), dtype=jnp.float32)
+
                 new_obs, new_env_state, reward, new_done, info = env.step(
                     rng_s, env_state, new_action, env_params
                 )
@@ -606,11 +620,11 @@ def make_train(config):
                     q_val=q_vals,
                     old_p_val=q_vals_perm
                 )
-                return (new_obs, new_env_state, rng), (transition, info)
+                return (new_obs, new_env_state, rng), (transition, info, q_val_perm_proportion)
 
             # step the env
             rng, _rng = jax.random.split(rng)
-            (*expl_state, rng), (transitions, infos) = jax.lax.scan(
+            (*expl_state, rng), (transitions, infos, q_val_perm_proportions) = jax.lax.scan(
                 _step_env,
                 (*expl_state, _rng),
                 None,
@@ -633,6 +647,8 @@ def make_train(config):
                 train=False,
             )
             last_q = jnp.max(last_q, axis=-1)
+
+            metrics["q_val_perm_proportion"] = jnp.nanmean(q_val_perm_proportions)
 
             def _get_target(lambda_returns_and_next_q, transition):
                 lambda_returns, next_q = lambda_returns_and_next_q
@@ -771,13 +787,14 @@ def make_train(config):
             )
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
-            metrics = {
+            metrics_ = {
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
             }
+            metrics.update(metrics_)
             done_infos = jax.tree_util.tree_map(
                 lambda x: (x * infos["returned_episode"]).sum()
                 / infos["returned_episode"].sum(),
@@ -1199,7 +1216,7 @@ def make_train(config):
                             old_env_steps = metrics["env_step"]
                             metrics = {
                                     f"rng{int(original_rng)}/{k}": v
-                                    for k, v in metrics.items()
+                                    for k, v in to_log.items()
                                 }
                             metrics["env_step"] = old_env_steps
                         wandb.log(metrics, step=us)
