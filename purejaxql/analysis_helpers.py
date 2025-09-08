@@ -38,19 +38,21 @@ def ema_update(old: jnp.ndarray, new: jnp.ndarray, alpha: float) -> jnp.ndarray:
 # --------------------------------------------------------------------------------------
 
 def effective_rank(X: jnp.ndarray, delta: float = 0.01) -> jnp.ndarray:
-    """
-    Stable effective rank based on singular values.
-    X: [B, D] or [B, ...] (will be flattened to [B, D]).
-    Returns the smallest k s.t. sum_{i=1..k} s_i / sum s_i >= 1 - delta.
-    """
-    if X.ndim > 2:
-        X = X.reshape(X.shape[0], -1)
-    s = jnp.linalg.svd(X, compute_uv=False, full_matrices=False)  # [min(B,D)]
-    s_sum = jnp.sum(s) + 1e-12
-    csum = jnp.cumsum(s) / s_sum
-    k = jnp.argmax(csum >= (1.0 - delta)) + 1
-    return k
+    # X is [B, D] (rows = samples, cols = features); if more dims, flatten features
+    assert X.ndim == 2
 
+    s = jnp.linalg.svd(X, compute_uv=False, full_matrices=False)  # sorted desc
+    s_sum = jnp.sum(s)
+
+    # If all singular values are ~0, define rank as 0.
+    def zero_rank(_):
+        return jnp.array(0, dtype=jnp.int32)
+
+    def nonzero_rank(_):
+        csum = jnp.cumsum(s)/s_sum
+        return jnp.argmax(csum >= (1.0 - delta)).astype(jnp.int32) + 1
+
+    return jax.lax.cond(s_sum <= 0.0, zero_rank, nonzero_rank, operand=None)
 
 def effective_rank_per_expert(Y: jnp.ndarray, delta: float = 0.01) -> jnp.ndarray:
     """
@@ -135,7 +137,6 @@ def ntk_srank(apply_fn: Callable,
 # --------------------------------------------------------------------------------------
 
 def dormant_fraction(acts: jnp.ndarray,
-                     tau: float = 0.05,
                      reduce_spatial: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Fraction of τ-dormant units in a layer: units with mean |activation| below tau.
@@ -146,22 +147,21 @@ def dormant_fraction(acts: jnp.ndarray,
       Conv/tokens: [B, H, W, C] or [B, M, D]
     """
     a = jnp.abs(acts)
-    if acts.ndim >= 3:  # conv or tokens
-        if reduce_spatial:
-            # average over all non-batch, non-channel dims except the last feature dim
-            a = jnp.mean(a, axis=tuple(range(1, acts.ndim - 1)))  # -> [B, C/D]
-        else:
-            # average over spatial/tokens, keep feature dim
-            a = a.reshape(a.shape[0], -1, a.shape[-1])  # [B, S, F]
-            a = jnp.mean(a, axis=1)                     # [B, F]
-    elif acts.ndim == 2:  # [B, D]
-        pass
-    else:
-        a = a.reshape(a.shape[0], -1)
+    # if acts.ndim >= 3:  # conv or tokens
+    #     if reduce_spatial:
+    #         # average over all non-batch, non-channel dims except the last feature dim
+    #         a = jnp.mean(a, axis=tuple(range(1, acts.ndim - 1)))  # -> [B, C/D]
+    #     else:
+    #         # average over spatial/tokens, keep feature dim
+    #         a = a.reshape(a.shape[0], -1, a.shape[-1])  # [B, S, F]
+    #         a = jnp.mean(a, axis=1)                     # [B, F]
+    # elif acts.ndim == 2:  # [B, D]
+    #     pass
+    # else:
+    #     a = a.reshape(a.shape[0], -1)
 
     per_unit = jnp.mean(a, axis=0)  # [units]
-    frac = jnp.mean(per_unit < tau)
-    return frac, per_unit
+    return per_unit
 
 
 def dormant_fraction_dict(intermediates: Dict[str, jnp.ndarray],

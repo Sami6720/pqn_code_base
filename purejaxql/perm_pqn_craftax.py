@@ -135,6 +135,11 @@ class QNetworkPerm(nn.Module):
                                 expert_out = nn.Dense(int(self.hidden_size * 0.88))(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
+
+                            if log_int:
+                                # NEW: expose per-expert, per-layer activations
+                                self.sow('intermediates', f'perm_exp{i}_layer{j}_act', expert_out)
+
                         stack.append(expert_out)
 
                     y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
@@ -319,7 +324,7 @@ class QNetwork(nn.Module):
 
                     # >>> CHANGE: expose per-expert features (for per-expert effective rank)
                     if log_int:
-                        self.sow('intermediates', 'perm_y_tilda_tilda', y_tilda_tilda)
+                        self.sow('intermediates', 'trans_y_tilda_tilda', y_tilda_tilda)
 
                     for i in range(self.config["NUM_EXPERTS"]):
                         # The input is a vector of shape M * D into the Q-value head
@@ -375,6 +380,10 @@ class QNetwork(nn.Module):
             x = nn.Dense(self.hidden_size)(x)
             x = normalize(x)
             x = nn.relu(x)
+
+            # NEW: expose per-layer activations
+            if log_int:  # already defined in your code
+                self.sow('intermediates', f'trans_layer{l}_act', x)
 
         # >>> CHANGE: expose last hidden before action head (even if you won't use full-module feature rank)
         if log_int:
@@ -1023,37 +1032,75 @@ def make_train(config):
                 # ----- build NaN metrics WITHOUT doing heavy work in the false branch -----
                 def _empty_analysis_metrics():
                     nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
-                    return {
+                    out = {
                         # transient
                         "trans/feat_srank": nan,
-                        "trans/cnn_dormant_frac": nan,
-                        "trans/ntk_srank_incl_cnn": nan,
-                        "trans/ntk_srank_excl_cnn": nan,
+                        # "trans/ntk_srank_incl_cnn": nan,
+                        # "trans/ntk_srank_excl_cnn": nan,
                         "trans/qnorm": nan,
-                        "trans/qvar_actions": nan,
-                        "trans/qvar_batch": nan,
+                        # "trans/qvar_actions": nan,
+                        # "trans/qvar_batch": nan,
+                        # NEW: MLP-only dormant (no CNN)
+                        "trans/dormant": nan,
+
                         # permanent (overall)
-                        "perm/feat_srank_per_expert_mean": nan,
-                        "perm/cnn_dormant_frac": nan,
-                        "perm/ntk_srank_incl_cnn": nan,
-                        "perm/ntk_srank_excl_cnn": nan,
+                        # "perm/feat_srank_per_expert_mean": nan,
+                        # "perm/ntk_srank_incl_cnn": nan,
+                        # "perm/ntk_srank_excl_cnn": nan,
                         "perm/qnorm": nan,
-                        "perm/qvar_actions": nan,
-                        "perm/qvar_batch": nan,
+                        # "perm/qvar_actions": nan,
+                        # "perm/qvar_batch": nan,
                         # permanent (per-expert Q functions)
-                        "perm/qnorm_per_expert_mean": nan,
-                        "perm/qvar_actions_per_expert_mean": nan,
-                        "perm/qvar_batch_per_expert_mean": nan,
+                        # "perm/qnorm_per_expert_mean": nan,
+                        # "perm/qvar_actions_per_expert_mean": nan,
+                        # "perm/qvar_batch_per_expert_mean": nan,
+
                         # MoE routing + phi
-                        "perm/dispatch_dormant_expert_frac": nan,
-                        "perm/dispatch_mean_mass_avg": nan,
-                        "perm/combine_dormant_expert_frac": nan,
-                        "perm/combine_mean_mass_avg": nan,
-                        "perm/phi_norm_global": nan,
+                        # "perm/dispatch_dormant_expert_frac": nan,
+                        # "perm/dispatch_mean_mass_avg": nan,
+                        # "perm/combine_dormant_expert_frac": nan,
+                        # "perm/combine_mean_mass_avg": nan,
+                        # "perm/phi_norm_global": nan,
                     }
+                    # NEW: per-expert dormant placeholders (MLP-only)
+                    for i in range(int(config.get("NUM_EXPERTS", 1))):
+                        out[f"perm/expert_{i}/dormant_all"] = nan
+                        out[f"perm/expert_{i}/feat_srank"] = nan
+                        out[f"perm/expert_{i}/qnorm"] = nan
+                        out[f"perm/expert_{i}/qvar_actions"] = nan
+                        out[f"perm/expert_{i}/qvar_batch"] = nan
+
+                    return out
 
                 # ----- Core analysis (heavy path runs only at interval) -----
                 def _compute_analysis(train_state, train_state_perm, transitions, rng):
+
+                    from typing import Optional
+
+                    def _per_unit_means(acts: jnp.ndarray) -> jnp.ndarray:
+                        # one mean per unit/channel, averaged over batch & spatial/tokens
+                        a = jnp.abs(acts)
+                        per_unit = jnp.mean(a, axis=0)  # [units]
+                        return per_unit  # [units]
+
+                    def _concat_means(arrs: list) -> Optional[jnp.ndarray]:
+                        """
+                        arrs: shape is L, B, D
+                        """
+                        vecs = []
+                        # Essentially iterating over each layer and then finding the mean
+                        # for each neuron over the batch.
+                        for a in arrs:
+                            if a is None:
+                                continue
+                            try:
+                                vecs.append(_per_unit_means(a))
+                            except Exception:
+                                pass
+                        if not vecs:
+                            return None
+                        return jnp.concatenate(vecs, axis=0)
+
                     out = _empty_analysis_metrics()  # correct structure & dtypes
 
                     # sample a small batch
@@ -1069,22 +1116,30 @@ def make_train(config):
                         q_t = network.apply(variables_t, obs, train=False)
                         inter_t = {}
 
-                    # cnn_out dormant
-                    cnn_out_t = _last_sown(inter_t, 'cnn_out')
-                    if cnn_out_t is not None:
-                        out["trans/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_t, tau=DORMANT_TAU)[0])
+                    if LOG_INTERNALS:
+                        trans_layer_acts = []
+                        for j in range(int(config.get("NUM_LAYERS", 2))):
+                            a = _last_sown(inter_t, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
+                            if a is not None:
+                                trans_layer_acts.append(a)
+                        means_all = _concat_means(trans_layer_acts) # [L, H]
+                        out["trans/dormant_all"] = _f32(jnp.mean(means_all < DORMANT_TAU))
+
+                    # # cnn_out dormant
+                    # cnn_out_t = _last_sown(inter_t, 'cnn_out')
+                    # if cnn_out_t is not None:
+                    #     out["trans/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_t, tau=DORMANT_TAU)[0])
 
                     # last_hidden effective rank
                     last_hidden_t = _last_sown(inter_t, 'last_hidden')
-                    if last_hidden_t is not None:
-                        out["trans/feat_srank"] = _f32(effective_rank(last_hidden_t, SRANK_DELTA))
+                    out["trans/feat_srank"] = _f32(effective_rank(last_hidden_t, SRANK_DELTA))
 
                     # NTK srank (incl/excl CNN)
-                    if config.get("ANALYZE_NTK", False):
-                        out["trans/ntk_srank_incl_cnn"] = _f32(ntk_srank(network.apply, variables_t, obs, delta=SRANK_DELTA))
-                        out["trans/ntk_srank_excl_cnn"] = _f32(ntk_srank(
-                            network.apply, variables_t, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
-                        ))
+                    # if config.get("ANALYZE_NTK", False):
+                    #     out["trans/ntk_srank_incl_cnn"] = _f32(ntk_srank(network.apply, variables_t, obs, delta=SRANK_DELTA))
+                    #     out["trans/ntk_srank_excl_cnn"] = _f32(ntk_srank(
+                    #         network.apply, variables_t, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
+                    #     ))
 
                     # Q diagnostics
                     qn_t, qvarA_t, qvarB_t = q_stats(q_t)
@@ -1102,23 +1157,41 @@ def make_train(config):
                             q_p = network_perm.apply(variables_p, obs, train=False)
                             inter_p = {}
 
+                        # --- per-expert MLP-only dormant (skip CNN) ---
+                        if LOG_INTERNALS:
+                            num_experts = int(config.get("NUM_EXPERTS", 1))
+                            num_layers  = int(config.get("NUM_LAYERS", 2))
+                            for i in range(num_experts):
+                                acts_i = []
+                                for j in range(num_layers):
+                                    a = _last_sown(inter_p, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                    if a is not None:
+                                        acts_i.append(a)
+                                means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                                out[f"perm/expert_{i}/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+
                         # per-expert feature srank (NOT full-module rank)
                         y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
                         if y_tilda_tilda is not None:
                             sranks = effective_rank_per_expert(y_tilda_tilda, delta=SRANK_DELTA)  # [N], float
-                            out["perm/feat_srank_per_expert_mean"] = _f32(jnp.mean(sranks))
+                            # out["perm/feat_srank_per_expert_mean"] = _f32(jnp.mean(sranks))
 
-                        # CNN dormant (perm)
-                        cnn_out_p = _last_sown(inter_p, 'cnn_out')
-                        if cnn_out_p is not None:
-                            out["perm/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_p, tau=DORMANT_TAU)[0])
+                            # NEW: log per-expert sranks as separate metrics
+                            num_experts = int(config.get("NUM_EXPERTS", 1))
+                            for i in range(num_experts):
+                                out[f"perm/expert_{i}/feat_srank"] = _f32(sranks[i])
+
+                        # # CNN dormant (perm)
+                        # cnn_out_p = _last_sown(inter_p, 'cnn_out')
+                        # if cnn_out_p is not None:
+                        #     out["perm/cnn_dormant_frac"] = _f32(dormant_fraction(cnn_out_p, tau=DORMANT_TAU)[0])
 
                         # NTK srank (incl/excl CNN)
-                        if config.get("ANALYZE_NTK", False):
-                            out["perm/ntk_srank_incl_cnn"] = _f32(ntk_srank(network_perm.apply, variables_p, obs, delta=SRANK_DELTA))
-                            out["perm/ntk_srank_excl_cnn"] = _f32(ntk_srank(
-                                network_perm.apply, variables_p, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
-                            ))
+                        # if config.get("ANALYZE_NTK", False):
+                        #     out["perm/ntk_srank_incl_cnn"] = _f32(ntk_srank(network_perm.apply, variables_p, obs, delta=SRANK_DELTA))
+                        #     out["perm/ntk_srank_excl_cnn"] = _f32(ntk_srank(
+                        #         network_perm.apply, variables_p, obs, delta=SRANK_DELTA, param_mask_fn=_mask_excl_cnn
+                        #     ))
 
                         # Q diagnostics (overall permanent)
                         qn_p, qvarA_p, qvarB_p = q_stats(q_p)
@@ -1128,37 +1201,39 @@ def make_train(config):
 
                         # Per-expert Q diagnostics
                         q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
-                        if q_per_exp is not None:
-                            qn_e, qvarA_e, qvarB_e = q_stats(q_per_exp)
-                            out["perm/qnorm_per_expert_mean"] = _f32(qn_e)
-                            out["perm/qvar_actions_per_expert_mean"] = _f32(qvarA_e)
-                            out["perm/qvar_batch_per_expert_mean"] = _f32(qvarB_e)
+                        B, N, A = q_per_exp.shape
+                        for i in range(N):
+                            q_p = q_per_exp[:, i, :]
+                            qn_p, qvarA_p, qvarB_p = q_stats(q_p)
+                            out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
+                            out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
+                            out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
 
-                        # MoE routing dormancy (dispatch & combine)
-                        dispatch = _last_sown(inter_p, 'perm_dispatch')
-                        if dispatch is not None:
-                            mass = routing_utilization(dispatch)
-                            out["perm/dispatch_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass, tau_exp=EXPERT_TAU))
-                            out["perm/dispatch_mean_mass_avg"] = _f32(jnp.mean(mass))
-
-                        comb_per_exp = _last_sown(inter_p, 'perm_combine_per_expert')
-                        comb = _last_sown(inter_p, 'perm_combine')
-                        _comb_to_use = comb_per_exp if comb_per_exp is not None else comb
-                        if _comb_to_use is not None:
-                            mass_c = routing_utilization(_comb_to_use)
-                            out["perm/combine_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass_c, tau_exp=EXPERT_TAU))
-                            out["perm/combine_mean_mass_avg"] = _f32(jnp.mean(mass_c))
-
-                        # phi norms (||phi||)
-                        phi = None
-                        flatp = traverse_util.flatten_dict(train_state_perm.params, sep='/')
-                        for k, v in flatp.items():
-                            if isinstance(k, str) and k.endswith('/phi'):
-                                phi = v
-                                break
-                        if phi is not None:
-                            phi_g, _, _ = phi_norms(phi)
-                            out["perm/phi_norm_global"] = _f32(phi_g)
+                        # # MoE routing dormancy (dispatch & combine)
+                        # dispatch = _last_sown(inter_p, 'perm_dispatch')
+                        # if dispatch is not None:
+                        #     mass = routing_utilization(dispatch)
+                        #     out["perm/dispatch_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass, tau_exp=EXPERT_TAU))
+                        #     out["perm/dispatch_mean_mass_avg"] = _f32(jnp.mean(mass))
+                        #
+                        # comb_per_exp = _last_sown(inter_p, 'perm_combine_per_expert')
+                        # comb = _last_sown(inter_p, 'perm_combine')
+                        # _comb_to_use = comb_per_exp if comb_per_exp is not None else comb
+                        # if _comb_to_use is not None:
+                        #     mass_c = routing_utilization(_comb_to_use)
+                        #     out["perm/combine_dormant_expert_frac"] = _f32(expert_dormant_fraction(mass_c, tau_exp=EXPERT_TAU))
+                        #     out["perm/combine_mean_mass_avg"] = _f32(jnp.mean(mass_c))
+                        #
+                        # # phi norms (||phi||)
+                        # phi = None
+                        # flatp = traverse_util.flatten_dict(train_state_perm.params, sep='/')
+                        # for k, v in flatp.items():
+                        #     if isinstance(k, str) and k.endswith('/phi'):
+                        #         phi = v
+                        #         break
+                        # if phi is not None:
+                        #     phi_g, _, _ = phi_norms(phi)
+                        #     out["perm/phi_norm_global"] = _f32(phi_g)
 
                     return out
 
