@@ -302,9 +302,9 @@ class QNetwork(nn.Module):
 
                     # >>> CHANGE: expose MoE internals for permanent net
                     if log_int:
-                        self.sow('intermediates', 'perm_logits', logits)
-                        self.sow('intermediates', 'perm_dispatch', dispatch)
-                        self.sow('intermediates', 'perm_combine_per_expert', combine_per_expert)
+                        self.sow('intermediates', 'trans_logits', logits)
+                        self.sow('intermediates', 'trans_dispatch', dispatch)
+                        self.sow('intermediates', 'trans_combine_per_expert', combine_per_expert)
 
                     x_tilda = jnp.einsum("bmd,bmnp->bnpd", x, dispatch)
 
@@ -1036,7 +1036,9 @@ def make_train(config):
                         # transient
                         "trans/feat_srank": nan,
                         "trans/qnorm": nan,
-                        "trans/dormant": nan,
+                        "trans/dormant_all": nan,
+                        "trans/qvar_actions": nan,
+                        "trans/qvar_batch": nan,
 
                         # permanent (overall)
                         "perm/qnorm": nan,
