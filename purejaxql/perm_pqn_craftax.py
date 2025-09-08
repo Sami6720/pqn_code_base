@@ -991,11 +991,11 @@ def make_train(config):
             if config["WANDB_MODE"] != "disabled":
 
                 # ===== Analysis knobs =====
-                ANALYSIS_INTERVAL = int(config.get("ANALYSIS_INTERVAL", 10))
-                ANALYSIS_BATCH    = int(config.get("ANALYSIS_BATCH", 64))
+                ANALYSIS_INTERVAL = int(config.get("WANDB_LOG_INTERVAL", 10))
+                ANALYSIS_BATCH    = int(config.get("ANALYSIS_BATCH", 256))
                 SRANK_DELTA       = float(config.get("SRANK_DELTA", 0.01))
-                DORMANT_TAU       = float(config.get("DORMANT_TAU", 0.05))
-                EXPERT_TAU        = float(config.get("EXPERT_TAU", 1e-3))
+                # NOTE: Tau chosen from the Dormant Neuron Phenomenon in DRL
+                DORMANT_TAU       = float(config.get("DORMANT_TAU", 0.025))
                 LOG_INTERNALS     = bool(config.get("LOG_INTERNALS", True))
 
                 import flax
@@ -1188,11 +1188,13 @@ def make_train(config):
                             out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
                             out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
 
+
                         # Combine weight diagnostics
                         combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
                         mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
                         for i in range(N):
                             out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
+
 
                         # Parameter norm
                         def tree_l2_norm(params):
@@ -1208,7 +1210,6 @@ def make_train(config):
                 # ===== Gate heavy analysis sparsely inside the JIT =====
                 us = metrics["update_steps"]
                 us0 = us if jnp.ndim(us) == 0 else us[0]   # keep predicate scalar
-                jax.debug.print("us0 {x}", x=us0)
                 do_analyze = (us0 % ANALYSIS_INTERVAL) == 0
 
                 analysis_metrics = jax.lax.cond(
