@@ -1094,12 +1094,12 @@ def make_train(config):
                             if a is None:
                                 continue
                             try:
-                                vecs.append(_per_unit_means(a))
+                                vecs.append(_per_unit_means(a).reshape(-1))
                             except Exception:
                                 pass
                         if not vecs:
                             return None
-                        return jnp.concatenate(vecs, axis=0)
+                        return jnp.concatenate(vecs)
 
                     out = _empty_analysis_metrics()  # correct structure & dtypes
 
