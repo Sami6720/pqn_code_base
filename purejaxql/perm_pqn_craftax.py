@@ -1058,11 +1058,13 @@ def make_train(config):
                         "trans/dormant_all": nan,
                         "trans/qvar_actions": nan,
                         "trans/qvar_batch": nan,
+                        "trans/param_norm": nan,
 
                         # permanent (overall)
                         "perm/qnorm": nan,
                         "perm/qvar_actions": nan,
                         "perm/qvar_batch": nan,
+                        "perm/param_norm": nan
                     }
                     # NEW: per-expert dormant placeholders (MLP-only)
                     for i in range(int(config.get("NUM_EXPERTS", 1))):
@@ -1191,6 +1193,15 @@ def make_train(config):
                         mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
                         for i in range(N):
                             out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
+
+                        # Parameter norm
+                        def tree_l2_norm(params):
+                            """Compute the L2 norm of all parameters in a PyTree."""
+                            leaves, _ = jax.tree_util.tree_flatten(params)
+                            return jnp.sqrt(sum(jnp.sum(jnp.square(p)) for p in leaves))
+
+                        out["trans/param_norm"] = tree_l2_norm(train_state.params)
+                        out["perm/param_norm"] = tree_l2_norm(train_state_perm.params)
 
                     return out
 
