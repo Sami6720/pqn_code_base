@@ -165,6 +165,8 @@ class QNetworkPerm(nn.Module):
                         return x
                     elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "softmax_over_n_meanpool":
                         combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3)), axis=1) # BN
+                        if log_int:
+                            self.sow('intermediates', 'combine_weight_per_expert', combine_q_vectors)
                         x = jnp.einsum("bn,bna->ba", combine_q_vectors, y)
                         return x
                     else:
@@ -1069,6 +1071,7 @@ def make_train(config):
                         out[f"perm/expert_{i}/qnorm"] = nan
                         out[f"perm/expert_{i}/qvar_actions"] = nan
                         out[f"perm/expert_{i}/qvar_batch"] = nan
+                        out[f"perm/expert_{i}/weight"] = nan
 
                     return out
 
@@ -1182,6 +1185,12 @@ def make_train(config):
                             out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
                             out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
                             out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
+
+                        # Combine weight diagnostics
+                        combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
+                        mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
+                        for i in range(N):
+                            out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
 
                     return out
 
