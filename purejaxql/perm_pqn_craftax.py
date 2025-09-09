@@ -216,6 +216,9 @@ class QNetworkPerm(nn.Module):
             x = normalize(x)
             x = nn.relu(x)
 
+            if log_int:
+                self.sow('intermediates', f'perm_layer{l}_act', x)
+
         # >>> CHANGE: expose last hidden before action head (even if you won't use full-module feature rank)
         if log_int:
             self.sow('intermediates', 'last_hidden', x)
@@ -920,7 +923,8 @@ def make_train(config):
                                     lambda x: config["TRANSIENT_WEIGHT_DECAY"] *  x, train_state_trans.params
                                 )
                             )
-
+                        elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'no_reset':
+                            temp_train_state = train_state_trans
                         elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'reinit_action_heads':
                             assert config["USE_SOFT_MOE_MULTI_EXPERT_TRANS"] == False 
                             rng, _rng = jax.random.split(rng)
@@ -1064,7 +1068,10 @@ def make_train(config):
                         "perm/qnorm": nan,
                         "perm/qvar_actions": nan,
                         "perm/qvar_batch": nan,
-                        "perm/param_norm": nan
+                        "perm/param_norm": nan,
+                        #Not soft-moe
+                        "perm/dormant_all": nan,
+                        "perm/feat_srank": nan
                     }
                     # NEW: per-expert dormant placeholders (MLP-only)
                     for i in range(int(config.get("NUM_EXPERTS", 1))):
@@ -1151,26 +1158,38 @@ def make_train(config):
                             inter_p = {}
 
                         # --- per-expert MLP-only dormant (skip CNN) ---
-                        if LOG_INTERNALS:
-                            num_experts = int(config.get("NUM_EXPERTS", 1))
-                            num_layers  = int(config.get("NUM_LAYERS", 2))
-                            for i in range(num_experts):
-                                acts_i = []
-                                for j in range(num_layers):
-                                    a = _last_sown(inter_p, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                    if a is not None:
-                                        acts_i.append(a)
-                                means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
-                                out[f"perm/expert_{i}/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                        if config["USE_SOFT_MOE_MULTI_EXPERT"]:
+                            if LOG_INTERNALS:
+                                num_experts = int(config.get("NUM_EXPERTS", 1))
+                                num_layers  = int(config.get("NUM_LAYERS", 2))
+                                for i in range(num_experts):
+                                    acts_i = []
+                                    for j in range(num_layers):
+                                        a = _last_sown(inter_p, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                        if a is not None:
+                                            acts_i.append(a)
+                                    means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                                    out[f"perm/expert_{i}/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
-                        # per-expert feature srank (NOT full-module rank)
-                        y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
-                        if y_tilda_tilda is not None:
-                            sranks = effective_rank_per_expert(y_tilda_tilda, delta=SRANK_DELTA)  # [N], float
-                            # NEW: log per-expert sranks as separate metrics
-                            num_experts = int(config.get("NUM_EXPERTS", 1))
-                            for i in range(num_experts):
-                                out[f"perm/expert_{i}/feat_srank"] = _f32(sranks[i])
+                            # per-expert feature srank (NOT full-module rank)
+                            y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
+                            if y_tilda_tilda is not None:
+                                sranks = effective_rank_per_expert(y_tilda_tilda, delta=SRANK_DELTA)  # [N], float
+                                # NEW: log per-expert sranks as separate metrics
+                                num_experts = int(config.get("NUM_EXPERTS", 1))
+                                for i in range(num_experts):
+                                    out[f"perm/expert_{i}/feat_srank"] = _f32(sranks[i])
+                        else:
+                            last_hidden_p = _last_sown(inter_p, 'last_hidden')
+                            out["perm/feat_srank"] = _f32(effective_rank(last_hidden_p, SRANK_DELTA))
+                            acts_i = []
+                            num_layers  = int(config.get("NUM_LAYERS", 2))
+                            for j in range(num_layers):
+                                a = _last_sown(inter_p, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                if a is not None:
+                                    acts_i.append(a)
+                            means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                            out[f"perm/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
                         # Q diagnostics (overall permanent)
                         qn_p, qvarA_p, qvarB_p = q_stats(q_p)
@@ -1179,21 +1198,22 @@ def make_train(config):
                         out["perm/qvar_batch"] = _f32(qvarB_p)
 
                         # Per-expert Q diagnostics
-                        q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
-                        B, N, A = q_per_exp.shape
-                        for i in range(N):
-                            q_p = q_per_exp[:, i, :]
-                            qn_p, qvarA_p, qvarB_p = q_stats(q_p)
-                            out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
-                            out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
-                            out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
+                        if config["USE_SOFT_MOE_MULTI_EXPERT"]:
+                            q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
+                            B, N, A = q_per_exp.shape
+                            for i in range(N):
+                                q_p = q_per_exp[:, i, :]
+                                qn_p, qvarA_p, qvarB_p = q_stats(q_p)
+                                out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
+                                out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
+                                out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
 
 
-                        # Combine weight diagnostics
-                        combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
-                        mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
-                        for i in range(N):
-                            out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
+                            # Combine weight diagnostics
+                            combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
+                            mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
+                            for i in range(N):
+                                out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
 
 
                         # Parameter norm
