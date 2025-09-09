@@ -169,6 +169,32 @@ class QNetworkPerm(nn.Module):
                             self.sow('intermediates', 'combine_weight_per_expert', combine_q_vectors)
                         x = jnp.einsum("bn,bna->ba", combine_q_vectors, y)
                         return x
+                    elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "attn":
+                        # y: [B, N, A]  (per-expert Q vectors)
+                        dk = int(self.config.get("ATTN_DK", max(32, y.shape[-1] // 2)))
+                        temp = float(self.config.get("ATTN_TEMPERATURE", 1.0))
+                        stop_g = bool(self.config.get("ATTN_STOP_GRAD", True))
+
+                        # Optionally detach attention inputs (keeps head stable)
+                        y_for_attn = jax.lax.stop_gradient(y) if stop_g else y
+
+                        # Keys per expert from its Q vector: [B, N, dk]
+                        keys = nn.Dense(dk, name="perm_attn_keys")(y_for_attn)
+
+                        # Global query from mean Q over experts: [B, dk]
+                        query = nn.Dense(dk, name="perm_attn_query")(jnp.mean(y_for_attn, axis=1))
+
+                        # Scores: [B, N], scaled dot-product attention
+                        scores = jnp.einsum("bnd,bd->bn", keys, query) / jnp.sqrt(dk)
+                        scores = (scores - jnp.max(scores, axis=1, keepdims=True)) / temp
+                        alpha = jax.nn.softmax(scores, axis=1)  # [B, N]
+
+                        if log_int:
+                            self.sow('intermediates', 'combine_weight_per_expert', alpha)
+
+                        # Mix experts by attention weights: [B, A]
+                        x = jnp.einsum("bna,bn->ba", y, alpha)
+                        return x
                     else:
                         raise ValueError("Incorrect EXPERT_OUTPUT_COMBINE_STRAT")
                 elif self.config['SOFT_MOE_APPR'] == 'big':
