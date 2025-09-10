@@ -113,7 +113,7 @@ class QNetworkPerm(nn.Module):
                     NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
                     phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
                     logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
-                    self.sow("intermediates", "phi_norm", jnp.norm(phi))
+                    self.sow("intermediates", "phi_norm", jnp.linalg.norm(phi))
 
                     dispatch = jax.nn.softmax(logits, axis=1)
                     combine_per_expert = jax.nn.softmax(logits, axis=-1)
@@ -1258,8 +1258,8 @@ def make_train(config):
                         leaves, _ = jax.tree_util.tree_flatten(params)
                         return jnp.sqrt(sum(jnp.sum(jnp.square(p)) for p in leaves))
 
-                    out["trans/param_norm"] = tree_l2_norm(train_state.params)
-                    out["perm/param_norm"] = tree_l2_norm(train_state_perm.params)
+                    out["trans/param_norm"] = _f32(tree_l2_norm(train_state.params))
+                    out["perm/param_norm"] = _f32(tree_l2_norm(train_state_perm.params))
 
                     # --- Are we stepping perm at all? ---
                     out["perm/grad_steps"] = _f32(train_state_perm.grad_steps)
