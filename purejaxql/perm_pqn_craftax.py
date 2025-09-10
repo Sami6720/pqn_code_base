@@ -113,6 +113,7 @@ class QNetworkPerm(nn.Module):
                     NUM_SLOTS_PER_EXPERT = (H * W) // self.config["NUM_EXPERTS"] # Each expert sort of gets equal number of tokens
                     phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
                     logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
+                    self.sow("intermediates", "phi_norm", jnp.norm(phi))
 
                     dispatch = jax.nn.softmax(logits, axis=1)
                     combine_per_expert = jax.nn.softmax(logits, axis=-1)
@@ -227,6 +228,7 @@ class QNetworkPerm(nn.Module):
                     return x
                 else:
                     raise ValueError("Incorrect SOFT_MOE_APPR: ", self.config["SOFT_MOE_APPR"])
+
             else:
                 # Flatten the output from encoder if not using soft-moe.
                 x = x.reshape(B, -1)
@@ -590,6 +592,8 @@ def make_train(config):
         def _update_step(runner_state, unused):
 
             train_state, train_state_perm, expl_state, test_metrics, rng = runner_state
+
+            old_params_perm = train_state_perm.params
 
             metrics = {}
 
@@ -1095,6 +1099,10 @@ def make_train(config):
                         "perm/qvar_actions": nan,
                         "perm/qvar_batch": nan,
                         "perm/param_norm": nan,
+                        "perm/grad_steps": nan,
+                        "perm/n_updates": nan,
+                        "perm/update_l2": nan,
+                        "perm/phi_norm": nan,
                         #Not soft-moe
                         "perm/dormant_all": nan,
                         "perm/feat_srank": nan
@@ -1241,15 +1249,27 @@ def make_train(config):
                             for i in range(N):
                                 out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
 
+                            out["perm/phi_norm"] = _last_sown(inter_p, 'phi_norm')
 
-                        # Parameter norm
-                        def tree_l2_norm(params):
-                            """Compute the L2 norm of all parameters in a PyTree."""
-                            leaves, _ = jax.tree_util.tree_flatten(params)
-                            return jnp.sqrt(sum(jnp.sum(jnp.square(p)) for p in leaves))
 
-                        out["trans/param_norm"] = tree_l2_norm(train_state.params)
-                        out["perm/param_norm"] = tree_l2_norm(train_state_perm.params)
+                    # Parameter norm
+                    def tree_l2_norm(params):
+                        """Compute the L2 norm of all parameters in a PyTree."""
+                        leaves, _ = jax.tree_util.tree_flatten(params)
+                        return jnp.sqrt(sum(jnp.sum(jnp.square(p)) for p in leaves))
+
+                    out["trans/param_norm"] = tree_l2_norm(train_state.params)
+                    out["perm/param_norm"] = tree_l2_norm(train_state_perm.params)
+
+                    # --- Are we stepping perm at all? ---
+                    out["perm/grad_steps"] = _f32(train_state_perm.grad_steps)
+                    out["perm/n_updates"]  = _f32(train_state_perm.n_updates)
+
+
+                    # Logging the norm of the update to the parameter norm
+                    upd = jax.tree_util.tree_map(lambda a,b: a-b, train_state_perm.params, old_params_perm)
+                    upd_l2 = jnp.sqrt(sum(jnp.sum(u**2) for u in jax.tree_util.tree_leaves(upd)))
+                    out["perm/update_l2"] = _f32(upd_l2)
 
                     return out
 
