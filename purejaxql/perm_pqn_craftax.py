@@ -516,7 +516,7 @@ def make_train(config):
 
     #NOTE: Observations for computing dormant neurons
     all_obs_files = os.listdir("obs_fixed")[:8]
-    all_processed_obs = [rearrange(jnp.load(f'obss/{f}'), 'x b ... -> (x b) ...') for f in all_obs_files]
+    all_processed_obs = [rearrange(jnp.load(f'obs_fixed/{f}'), 'x b ... -> (x b) ...') for f in all_obs_files]
     all_processed_obs = jnp.stack(all_processed_obs, axis=0)
     all_processed_obs = rearrange(all_processed_obs, 'x b ... -> (x b) ...')
     print(f"All processed observation shapes {all_processed_obs.shape}")
@@ -966,8 +966,8 @@ def make_train(config):
                             phi_key = [k for k in flat_grads.keys() if "phi" in k][0]
                             phi_grad = flat_grads[phi_key]
                             print("Phi grad shape ", phi_grad.shape)
-                            phi_grad_norm = jnp.linalg.norm(phi_grad)
-                            print(f"Phi grad shape {phi_grad.shape}")
+                            # phi_grad_norm = jnp.linalg.norm(phi_grad)
+                            # print(f"Phi grad shape {phi_grad.shape}")
                             # else jnp.full(shape_of_phi_grad)
                         # returns loss_perm, grads, grads_phi
 
@@ -1201,7 +1201,7 @@ def make_train(config):
                     def _per_unit_means(acts: jnp.ndarray) -> jnp.ndarray:
                         # one mean per unit/channel, averaged over batch & spatial/tokens
                         a = jnp.abs(acts)
-                        a /= reduce(a, 'b h -> b 1', 'mean')
+                        # a /= reduce(a, 'b h -> b 1', 'mean')
                         per_unit = jnp.mean(a, axis=0)  # [units]
                         return per_unit  # [units]
 
@@ -1245,6 +1245,8 @@ def make_train(config):
                         trans_layer_acts = []
                         for j in range(int(config.get("NUM_LAYERS", 2))):
                             a = _last_sown(inter_t, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
+                            print(f"a.shape {a.shape}")
+                            assert len(a.shape) == 2
                             if a is not None:
                                 trans_layer_acts.append(a)
                         means_all = _concat_means(trans_layer_acts) # [L, H]
@@ -1252,6 +1254,7 @@ def make_train(config):
                         trans_layer_acts_fixed = []
                         for j in range(int(config.get("NUM_LAYERS", 2))):
                             a = _last_sown(inter_t_fixed, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
+                            assert len(a.shape) == 2
                             if a is not None:
                                 trans_layer_acts_fixed.append(a)
                         means_all = _concat_means(trans_layer_acts_fixed) # [L, H]
@@ -1289,6 +1292,9 @@ def make_train(config):
                                     acts_i = []
                                     for j in range(num_layers):
                                         a = _last_sown(inter_p, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                        print(f"a.shape {a.shape}")
+                                        #TODO: NEED TO FIGURE OUT WHY len(a.shape) != 2
+                                        assert len(a.shape) == 2
                                         if a is not None:
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
@@ -1297,6 +1303,7 @@ def make_train(config):
                                     acts_i = []
                                     for j in range(num_layers):
                                         a = _last_sown(inter_p_fixed, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                        assert len(a.shape) == 2
                                         if a is not None:
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
@@ -1317,12 +1324,15 @@ def make_train(config):
                             num_layers  = int(config.get("NUM_LAYERS", 2))
                             for j in range(num_layers):
                                 a = _last_sown(inter_p, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                assert len(a.shape) == 2
                                 if a is not None:
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
                             out[f"perm/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                            acts_i = []
                             for j in range(num_layers):
                                 a = _last_sown(inter_p_fixed, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                assert len(a.shape) == 2
                                 if a is not None:
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
