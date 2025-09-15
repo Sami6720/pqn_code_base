@@ -34,6 +34,10 @@ from analysis_helpers import (
     effective_rank, effective_rank_per_expert, ntk_srank, dormant_fraction,
     routing_utilization, expert_dormant_fraction, phi_norms, q_stats,
 )
+import flax
+from einops import rearrange, reduce, einsum
+
+from flax import traverse_util
 
 def count_params(params: Any) -> int:
     """Total number of scalars in a JAX/Flax params PyTree."""
@@ -51,7 +55,7 @@ class QNetworkPerm(nn.Module):
     def __call__(self, x: jnp.ndarray, train: bool):
 
         # >>> CHANGE: enable/disable instrumentation from config
-        log_int = self.config.get("LOG_INTERNALS", False)  # when True we sow() intermediates
+        log_int = self.config.get("LOG_INTERNALS", True)  # when True we sow() intermediates
 
         if self.norm_type == "layer_norm":
             def normalize(x): return nn.LayerNorm()(x)
@@ -167,6 +171,9 @@ class QNetworkPerm(nn.Module):
                     elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "softmax_over_n_meanpool":
                         combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3)), axis=1) # BN
                         if log_int:
+                            softmax_input = jnp.mean(logits, axis=(1, 3))
+                            self.sow('intermediates', 'softmax_input', softmax_input)
+                        if log_int:
                             self.sow('intermediates', 'combine_weight_per_expert', combine_q_vectors)
                         x = jnp.einsum("bn,bna->ba", combine_q_vectors, y)
                         return x
@@ -205,6 +212,8 @@ class QNetworkPerm(nn.Module):
                     phi = self.param("phi", nn.initializers.normal(), (D, self.config["NUM_EXPERTS"], NUM_SLOTS_PER_EXPERT)) # Shape: DNP
                     logits = jnp.einsum("bmd,dnp->bmnp", x, phi)
 
+                    self.sow("intermediates", "phi_norm", jnp.linalg.norm(phi))
+
                     dispatch = jax.nn.softmax(logits, axis=1)
                     combine = jax.nn.softmax(logits, axis=(2, 3))
 
@@ -220,6 +229,11 @@ class QNetworkPerm(nn.Module):
                                 expert_out = nn.Dense(int(self.hidden_size * 0.88))(expert_out)
                             expert_out = normalize(expert_out)
                             expert_out = nn.relu(expert_out)
+
+                            if log_int:
+                                # NEW: expose per-expert, per-layer activations
+                                self.sow('intermediates', f'perm_exp{i}_layer{j}_act', expert_out)
+
                         stack.append(expert_out)
                     y_tilda = jnp.stack(stack, axis=1) # Shape: BNPD
 
@@ -267,7 +281,7 @@ class QNetwork(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
 
-        log_int = self.config.get("LOG_INTERNALS", False)  # when True we sow() intermediates
+        log_int = self.config.get("LOG_INTERNALS", True)  # when True we sow() intermediates
 
         if self.norm_type == "layer_norm":
             def normalize(x): return nn.LayerNorm()(x)
@@ -496,6 +510,18 @@ def make_train(config):
         )
         return chosed_actions
 
+
+    from einops import rearrange
+
+
+    #NOTE: Observations for computing dormant neurons
+    all_obs_files = os.listdir("obs_fixed")[:8]
+    all_processed_obs = [rearrange(jnp.load(f'obss/{f}'), 'x b ... -> (x b) ...') for f in all_obs_files]
+    all_processed_obs = jnp.stack(all_processed_obs, axis=0)
+    all_processed_obs = rearrange(all_processed_obs, 'x b ... -> (x b) ...')
+    print(f"All processed observation shapes {all_processed_obs.shape}")
+
+
     def train(rng):
 
         original_rng = rng[0]
@@ -554,7 +580,9 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
 
-        print(f"Transient Network params count: {count_params(train_state.params)}")
+        transient_parameters_count = count_params(train_state.params)
+
+        print(f"Transient Network params count: {transient_parameters_count}")
 
         if config["USE_PERM"]:
             def create_agent_perm(rng):
@@ -583,9 +611,11 @@ def make_train(config):
                 return train_state
             rng, _rng = jax.random.split(rng)
             train_state_perm = create_agent_perm(_rng)
-            print(f"Permanent Network params count: {count_params(train_state_perm.params)}")
+            permanent_network_parameter_count = count_params(train_state_perm.params)
+            print(f"Permanent Network params count: {permanent_network_parameter_count}")
             print("Hidden size: ", network_perm.hidden_size)
         else:
+            permanent_network_parameter_count = 0
             train_state_perm = None
 
         # TRAINING LOOP
@@ -671,6 +701,16 @@ def make_train(config):
                 timesteps=train_state.timesteps
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )  # update timesteps count
+
+            # def save_callback(observations, timesteps):
+            #     import numpy as np
+            #     is_save_time = timesteps % 24999936 == 0
+            #     # is_save_time = timesteps % 1
+            #     if is_save_time:
+            #         np.save(f"obs_{timesteps}.npz", np.array(observations))
+            #
+            # jax.debug.callback(save_callback, transitions.obs, train_state.timesteps)
+            #
 
             last_q = network.apply(
                 {
@@ -789,7 +829,7 @@ def make_train(config):
                         grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    return (train_state, rng), (loss, qvals)
+                    return (train_state, rng), (loss, qvals, grads)
 
                 def preprocess_transition(x, rng):
                     x = x.reshape(
@@ -810,14 +850,14 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals) = jax.lax.scan(
+                (train_state, rng), (loss, qvals, grads) = jax.lax.scan(
                     _learn_phase, (train_state, rng), (minibatches, targets)
                 )
 
-                return (train_state, rng), (loss, qvals)
+                return (train_state, rng), (loss, qvals, jax.flatten_util.ravel_pytree(grads)[0])
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals) = jax.lax.scan(
+            (train_state, rng), (loss, qvals, grads) = jax.lax.scan(
                 _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
             )
 
@@ -828,7 +868,12 @@ def make_train(config):
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
+                "trans/grad_norm": jnp.linalg.norm(jnp.mean(grads,axis=0))
             }
+
+            metrics['perm_parameter_count'] = permanent_network_parameter_count
+            metrics['trans_parameter_count'] = transient_parameters_count
+
             metrics.update(metrics_)
             done_infos = jax.tree_util.tree_map(
                 lambda x: (x * infos["returned_episode"]).sum()
@@ -913,7 +958,20 @@ def make_train(config):
                             grad_steps=train_state_perm.grad_steps + 1,
                             batch_stats=updates_perm["batch_stats"],
                         )
-                        return (train_state_perm, rng), loss_perm
+
+                        import flax
+                        # Flatten grads to find phi
+                        if config["USE_SOFT_MOE_MULTI_EXPERT"]:
+                            flat_grads = flax.traverse_util.flatten_dict(grads, sep="/")
+                            phi_key = [k for k in flat_grads.keys() if "phi" in k][0]
+                            phi_grad = flat_grads[phi_key]
+                            print("Phi grad shape ", phi_grad.shape)
+                            phi_grad_norm = jnp.linalg.norm(phi_grad)
+                            print(f"Phi grad shape {phi_grad.shape}")
+                            # else jnp.full(shape_of_phi_grad)
+                        # returns loss_perm, grads, grads_phi
+
+                        return (train_state_perm, rng), (loss_perm, grads)
 
                     def preprocess_transition_perm(x, rng):
                         x = x.reshape(
@@ -934,7 +992,7 @@ def make_train(config):
                     )
 
                     rng, _rng = jax.random.split(rng)
-                    (train_state_perm, rng), loss = jax.lax.scan(
+                    (train_state_perm, rng), (loss, grads_perm) = jax.lax.scan(
                         _learn_phase_perm, (train_state_perm, rng), (minibatches, targets)
                     )
 
@@ -993,22 +1051,33 @@ def make_train(config):
                         rng
                     )
 
-                    return (train_state_perm, modified_train_states_trans, rng), loss
+
+                    import flax
+                    from flax import traverse_util
+
+                    print(type(grads_perm))
+                    print(jax.flatten_util.ravel_pytree(grads_perm)[0].shape)
+
+                    return (train_state_perm, modified_train_states_trans, rng), (loss, jax.flatten_util.ravel_pytree(grads_perm)[0])
 
 
                 rng, _rng = jax.random.split(rng)
                 is_perm_learn_time = (
                     train_state.n_updates % config["PERM_UPDATE_FREQ"] == 0
                 )
-                dummy_loss = jnp.zeros(
-                    (config["NUM_EPOCHS"], config["NUM_MINIBATCHES"]))
-                (train_state_perm, train_state, rng), loss_perm = jax.lax.cond(
+
+                # None instead of zero since wandb filters out automatically.
+                dummy_loss = jnp.full(
+                    (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES"]), jnp.nan)
+                dummy_grad = jnp.full(
+                    (config["NUM_EPOCHS_PERM"], permanent_network_parameter_count), jnp.nan)
+                (train_state_perm, train_state, rng), (loss_perm, grad_perm) = jax.lax.cond(
                     is_perm_learn_time,
                     lambda train_state_perm, train_state, rng: jax.lax.scan(
                         _learn_epoch_perm, (train_state_perm, train_state,
-                                            rng), None, config["NUM_EPOCHS"]
+                                            rng), None, config["NUM_EPOCHS_PERM"]
                     ),
-                    lambda train_state_perm, train_state, rng: ((train_state_perm, train_state, rng), dummy_loss),
+                    lambda train_state_perm, train_state, rng: ((train_state_perm, train_state, rng), (dummy_loss, dummy_grad)),
                     train_state_perm,
                     train_state,
                     _rng
@@ -1020,6 +1089,8 @@ def make_train(config):
                     train_state_perm
                 )
 
+                metrics["perm/loss"] = jnp.nanmean(loss_perm)
+                metrics["perm/grad_norm"] = jnp.linalg.norm(jnp.nanmean(grad_perm, axis=0))
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
@@ -1090,6 +1161,7 @@ def make_train(config):
                         "trans/feat_srank": nan,
                         "trans/qnorm": nan,
                         "trans/dormant_all": nan,
+                        "trans/dormant_all_fixed": nan,
                         "trans/qvar_actions": nan,
                         "trans/qvar_batch": nan,
                         "trans/param_norm": nan,
@@ -1105,11 +1177,14 @@ def make_train(config):
                         "perm/phi_norm": nan,
                         #Not soft-moe
                         "perm/dormant_all": nan,
+                        "perm/dormant_all_fixed": nan,
+                        "perm/softmax_input_norm":nan,
                         "perm/feat_srank": nan
                     }
                     # NEW: per-expert dormant placeholders (MLP-only)
                     for i in range(int(config.get("NUM_EXPERTS", 1))):
                         out[f"perm/expert_{i}/dormant_all"] = nan
+                        out[f"perm/expert_{i}/dormant_all_fixed"] = nan
                         out[f"perm/expert_{i}/feat_srank"] = nan
                         out[f"perm/expert_{i}/qnorm"] = nan
                         out[f"perm/expert_{i}/qvar_actions"] = nan
@@ -1126,6 +1201,7 @@ def make_train(config):
                     def _per_unit_means(acts: jnp.ndarray) -> jnp.ndarray:
                         # one mean per unit/channel, averaged over batch & spatial/tokens
                         a = jnp.abs(acts)
+                        a /= reduce(a, 'b h -> b 1', 'mean')
                         per_unit = jnp.mean(a, axis=0)  # [units]
                         return per_unit  # [units]
 
@@ -1137,14 +1213,14 @@ def make_train(config):
                         # Essentially iterating over each layer and then finding the mean
                         # for each neuron over the batch.
                         for a in arrs:
-                            if a is None:
-                                continue
-                            try:
-                                vecs.append(_per_unit_means(a).reshape(-1))
-                            except Exception:
-                                pass
-                        if not vecs:
-                            return None
+                            # if a is None:
+                            #     continue
+                            # try:
+                            vecs.append(_per_unit_means(a).reshape(-1))
+                            # except Exception:
+                            #     pass
+                        # if not vecs:
+                        #     return None
                         return jnp.concatenate(vecs)
 
                     out = _empty_analysis_metrics()  # correct structure & dtypes
@@ -1158,9 +1234,12 @@ def make_train(config):
                     if LOG_INTERNALS:
                         q_t, coll_t = network.apply(variables_t, obs, train=False, mutable=['intermediates'])
                         inter_t = _get_intermediates(coll_t)
+                        q_t_fixed, coll_t_fixed = network.apply(variables_t, all_processed_obs, train=False, mutable=['intermediates'])
+                        inter_t_fixed = _get_intermediates(coll_t_fixed)
                     else:
                         q_t = network.apply(variables_t, obs, train=False)
                         inter_t = {}
+                        inter_t_fixed = {}
 
                     if LOG_INTERNALS:
                         trans_layer_acts = []
@@ -1170,6 +1249,13 @@ def make_train(config):
                                 trans_layer_acts.append(a)
                         means_all = _concat_means(trans_layer_acts) # [L, H]
                         out["trans/dormant_all"] = _f32(jnp.mean(means_all < DORMANT_TAU))
+                        trans_layer_acts_fixed = []
+                        for j in range(int(config.get("NUM_LAYERS", 2))):
+                            a = _last_sown(inter_t_fixed, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
+                            if a is not None:
+                                trans_layer_acts_fixed.append(a)
+                        means_all = _concat_means(trans_layer_acts_fixed) # [L, H]
+                        out["trans/dormant_all_fixed"] = _f32(jnp.mean(means_all < DORMANT_TAU))
 
                     # last_hidden effective rank
                     last_hidden_t = _last_sown(inter_t, 'last_hidden')
@@ -1187,9 +1273,12 @@ def make_train(config):
                         if LOG_INTERNALS:
                             q_p, coll_p = network_perm.apply(variables_p, obs, train=False, mutable=['intermediates'])
                             inter_p = _get_intermediates(coll_p)
+                            q_p_fixed, coll_p_fixed = network_perm.apply(variables_p, all_processed_obs, train=False, mutable=['intermediates'])
+                            inter_p_fixed = _get_intermediates(coll_p_fixed)
                         else:
                             q_p = network_perm.apply(variables_p, obs, train=False)
                             inter_p = {}
+                            inter_p_fixed = {}
 
                         # --- per-expert MLP-only dormant (skip CNN) ---
                         if config["USE_SOFT_MOE_MULTI_EXPERT"]:
@@ -1204,6 +1293,14 @@ def make_train(config):
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
                                     out[f"perm/expert_{i}/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                                for i in range(num_experts):
+                                    acts_i = []
+                                    for j in range(num_layers):
+                                        a = _last_sown(inter_p_fixed, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                        if a is not None:
+                                            acts_i.append(a)
+                                    means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                                    out[f"perm/expert_{i}/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
                             # per-expert feature srank (NOT full-module rank)
                             y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
@@ -1224,6 +1321,12 @@ def make_train(config):
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
                             out[f"perm/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                            for j in range(num_layers):
+                                a = _last_sown(inter_p_fixed, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                if a is not None:
+                                    acts_i.append(a)
+                            means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                            out[f"perm/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
                         # Q diagnostics (overall permanent)
                         qn_p, qvarA_p, qvarB_p = q_stats(q_p)
@@ -1233,23 +1336,29 @@ def make_train(config):
 
                         # Per-expert Q diagnostics
                         if config["USE_SOFT_MOE_MULTI_EXPERT"]:
-                            q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
-                            B, N, A = q_per_exp.shape
-                            for i in range(N):
-                                q_p = q_per_exp[:, i, :]
-                                qn_p, qvarA_p, qvarB_p = q_stats(q_p)
-                                out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
-                                out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
-                                out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
+
+                            if config["SOFT_MOE_APPR"] == 'ours':
+                                q_per_exp = _last_sown(inter_p, 'perm_qs_per_expert')  # [B,N,A]
+                                B, N, A = q_per_exp.shape
+                                for i in range(N):
+                                    q_p = q_per_exp[:, i, :]
+                                    qn_p, qvarA_p, qvarB_p = q_stats(q_p)
+                                    out[f"perm/expert_{i}/qnorm"] = _f32(qn_p)
+                                    out[f"perm/expert_{i}/qvar_actions"] = _f32(qvarA_p)
+                                    out[f"perm/expert_{i}/qvar_batch"] = _f32(qvarB_p)
 
 
-                            # Combine weight diagnostics
-                            combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
-                            mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
-                            for i in range(N):
-                                out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
+                                # Combine weight diagnostics
+                                combine_weight_per_expert = _last_sown(inter_p, 'combine_weight_per_expert') # B, N
+                                mean_combine_weight_per_expert = combine_weight_per_expert.mean(axis=0).reshape(-1)
+                                for i in range(N):
+                                    out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
+                                softmax_input = _last_sown(inter_p, 'softmax_input') # B, N
+                                softmax_input_norm = jnp.linalg.norm(softmax_input, axis=-1)
+                                out[f"perm/softmax_input_norm"] = softmax_input_norm.mean()
 
-                            out["perm/phi_norm"] = _last_sown(inter_p, 'phi_norm')
+
+                                out["perm/phi_norm"] = _last_sown(inter_p, 'phi_norm')
 
 
                     # Parameter norm
