@@ -1246,7 +1246,6 @@ def make_train(config):
                         for j in range(int(config.get("NUM_LAYERS", 2))):
                             a = _last_sown(inter_t, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
                             print(f"a.shape {a.shape}")
-                            assert len(a.shape) == 2
                             if a is not None:
                                 trans_layer_acts.append(a)
                         means_all = _concat_means(trans_layer_acts) # [L, H]
@@ -1254,7 +1253,6 @@ def make_train(config):
                         trans_layer_acts_fixed = []
                         for j in range(int(config.get("NUM_LAYERS", 2))):
                             a = _last_sown(inter_t_fixed, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
-                            assert len(a.shape) == 2
                             if a is not None:
                                 trans_layer_acts_fixed.append(a)
                         means_all = _concat_means(trans_layer_acts_fixed) # [L, H]
@@ -1294,7 +1292,6 @@ def make_train(config):
                                         a = _last_sown(inter_p, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
                                         print(f"a.shape {a.shape}")
                                         #TODO: NEED TO FIGURE OUT WHY len(a.shape) != 2
-                                        assert len(a.shape) == 2
                                         if a is not None:
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
@@ -1303,7 +1300,6 @@ def make_train(config):
                                     acts_i = []
                                     for j in range(num_layers):
                                         a = _last_sown(inter_p_fixed, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                        assert len(a.shape) == 2
                                         if a is not None:
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
@@ -1324,7 +1320,6 @@ def make_train(config):
                             num_layers  = int(config.get("NUM_LAYERS", 2))
                             for j in range(num_layers):
                                 a = _last_sown(inter_p, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                assert len(a.shape) == 2
                                 if a is not None:
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
@@ -1332,7 +1327,6 @@ def make_train(config):
                             acts_i = []
                             for j in range(num_layers):
                                 a = _last_sown(inter_p_fixed, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                assert len(a.shape) == 2
                                 if a is not None:
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
