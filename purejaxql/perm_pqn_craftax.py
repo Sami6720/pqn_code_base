@@ -862,13 +862,14 @@ def make_train(config):
             )
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
+            print("transient grads shape", grads.shape)
             metrics_ = {
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
                 "grad_steps": train_state.grad_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
-                "trans/grad_norm": jnp.linalg.norm(jnp.mean(grads,axis=0))
+                "trans/grad_norm": jnp.mean(jnp.linalg.norm(grads, axis=-1))
             }
 
             metrics['perm_parameter_count'] = permanent_network_parameter_count
@@ -1100,8 +1101,12 @@ def make_train(config):
                 )
 
                 metrics["perm/loss"] = jnp.nanmean(loss_perm)
-                metrics["perm/grad_norm"] = jnp.linalg.norm(jnp.nanmean(grad_perm, axis=0))
-                metrics["perm/phi_grad_norm"] = jnp.linalg.norm(jnp.nanmean(phi_grad, axis=0))
+                print("permanent gradient shape", grad_perm.shape)
+                print("permanent gradient shape", grad_perm.shape)
+                assert len(grad_perm.shape) == 2
+                assert len(phi_grad.shape) == 2
+                metrics["perm/grad_norm"] = jnp.nanmean(jnp.linalg.norm(grad_perm, axis=-1))
+                metrics["perm/phi_grad_norm"] = jnp.nanmean(jnp.linalg.norm(phi_grad, axis=-1))
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
