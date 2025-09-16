@@ -969,9 +969,11 @@ def make_train(config):
                             # phi_grad_norm = jnp.linalg.norm(phi_grad)
                             # print(f"Phi grad shape {phi_grad.shape}")
                             # else jnp.full(shape_of_phi_grad)
+                        else:
+                            phi_grad = jnp.full((64, 4, 16), jnp.nan)
                         # returns loss_perm, grads, grads_phi
 
-                        return (train_state_perm, rng), (loss_perm, grads)
+                        return (train_state_perm, rng), (loss_perm, grads, phi_grad)
 
                     def preprocess_transition_perm(x, rng):
                         x = x.reshape(
@@ -992,7 +994,7 @@ def make_train(config):
                     )
 
                     rng, _rng = jax.random.split(rng)
-                    (train_state_perm, rng), (loss, grads_perm) = jax.lax.scan(
+                    (train_state_perm, rng), (loss, grads_perm, phi_grads) = jax.lax.scan(
                         _learn_phase_perm, (train_state_perm, rng), (minibatches, targets)
                     )
 
@@ -1058,7 +1060,12 @@ def make_train(config):
                     print(type(grads_perm))
                     print(jax.flatten_util.ravel_pytree(grads_perm)[0].shape)
 
-                    return (train_state_perm, modified_train_states_trans, rng), (loss, jax.flatten_util.ravel_pytree(grads_perm)[0])
+
+                    print(jax.flatten_util.ravel_pytree(phi_grads)[0].shape)
+
+                    return (train_state_perm, modified_train_states_trans, rng), (loss, jax.flatten_util.ravel_pytree(grads_perm)[0],
+                                                                                  jax.flatten_util.ravel_pytree(phi_grads)[0]
+                                                                                  )
 
 
                 rng, _rng = jax.random.split(rng)
@@ -1071,13 +1078,16 @@ def make_train(config):
                     (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES"]), jnp.nan)
                 dummy_grad = jnp.full(
                     (config["NUM_EPOCHS_PERM"], permanent_network_parameter_count), jnp.nan)
-                (train_state_perm, train_state, rng), (loss_perm, grad_perm) = jax.lax.cond(
+                dummy_phi_grad = jnp.full(
+                    (config["NUM_EPOCHS_PERM"], 4096), jnp.nan # 4096 is the number of parameters in phi if use_soft_moe
+                )
+                (train_state_perm, train_state, rng), (loss_perm, grad_perm, phi_grad) = jax.lax.cond(
                     is_perm_learn_time,
                     lambda train_state_perm, train_state, rng: jax.lax.scan(
                         _learn_epoch_perm, (train_state_perm, train_state,
                                             rng), None, config["NUM_EPOCHS_PERM"]
                     ),
-                    lambda train_state_perm, train_state, rng: ((train_state_perm, train_state, rng), (dummy_loss, dummy_grad)),
+                    lambda train_state_perm, train_state, rng: ((train_state_perm, train_state, rng), (dummy_loss, dummy_grad, dummy_phi_grad)),
                     train_state_perm,
                     train_state,
                     _rng
@@ -1091,6 +1101,7 @@ def make_train(config):
 
                 metrics["perm/loss"] = jnp.nanmean(loss_perm)
                 metrics["perm/grad_norm"] = jnp.linalg.norm(jnp.nanmean(grad_perm, axis=0))
+                metrics["perm/phi_grad_norm"] = jnp.linalg.norm(jnp.nanmean(phi_grad, axis=0))
 
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
