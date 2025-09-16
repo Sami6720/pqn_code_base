@@ -1211,9 +1211,13 @@ def make_train(config):
 
                     def _per_unit_means(acts: jnp.ndarray) -> jnp.ndarray:
                         # one mean per unit/channel, averaged over batch & spatial/tokens
-                        a = jnp.abs(acts)
-                        # a /= reduce(a, 'b h -> b 1', 'mean')
-                        per_unit = jnp.mean(a, axis=0)  # [units]
+
+                        per_neuron_mean = reduce(jnp.abs(acts), "... hidden_dim -> hidden_dim", "mean")
+                        layer_mean = reduce(per_neuron_mean, "h -> 1", "mean")
+
+                        per_unit = per_neuron_mean/layer_mean
+
+                        assert len(per_unit.shape) == 1
                         return per_unit  # [units]
 
                     def _concat_means(arrs: list) -> Optional[jnp.ndarray]:
@@ -1227,7 +1231,7 @@ def make_train(config):
                             # if a is None:
                             #     continue
                             # try:
-                            vecs.append(_per_unit_means(a).reshape(-1))
+                            vecs.append(_per_unit_means(a))
                             # except Exception:
                             #     pass
                         # if not vecs:
@@ -1369,11 +1373,12 @@ def make_train(config):
                                 for i in range(N):
                                     out[f"perm/expert_{i}/weight"] = mean_combine_weight_per_expert[i]
                                 softmax_input = _last_sown(inter_p, 'softmax_input') # B, N
+                                print("Softmax input shape: ", softmax_input.shape)
                                 softmax_input_norm = jnp.linalg.norm(softmax_input, axis=-1)
                                 out[f"perm/softmax_input_norm"] = softmax_input_norm.mean()
 
 
-                                out["perm/phi_norm"] = _last_sown(inter_p, 'phi_norm')
+                            out["perm/phi_norm"] = _last_sown(inter_p, 'phi_norm')
 
 
                     # Parameter norm
