@@ -169,7 +169,8 @@ class QNetworkPerm(nn.Module):
                         x = jnp.sum(y, axis=1)
                         return x
                     elif self.config["EXPERT_OUTPUT_COMBINE_STRAT"] == "softmax_over_n_meanpool":
-                        combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3)), axis=1) # BN
+                        combine_q_vec_temp = self.config.get('MEANPOOL_TEMP', 3e-5)
+                        combine_q_vectors = jax.nn.softmax(jnp.mean(logits, axis=(1, 3))/combine_q_vec_temp, axis=1) # BN
                         if log_int:
                             softmax_input = jnp.mean(logits, axis=(1, 3))
                             self.sow('intermediates', 'softmax_input', softmax_input)
@@ -1023,6 +1024,7 @@ def make_train(config):
                                 # Get a fresh param tree for this module on the same input shape
                                 new_params_full = network.init(rng, dummy_input, train=False)['params']
                                 # Splice only the head(s)
+                                import flax
                                 flat_old = flax.traverse_util.flatten_dict(ts.params, sep="/")
                                 flat_new = flax.traverse_util.flatten_dict(new_params_full, sep="/")
                                 # jax.debug.print("get here, {k}", k=flat_new.keys())
@@ -1102,7 +1104,7 @@ def make_train(config):
 
                 metrics["perm/loss"] = jnp.nanmean(loss_perm)
                 print("permanent gradient shape", grad_perm.shape)
-                print("permanent gradient shape", grad_perm.shape)
+                print("phi gradient shape", phi_grad.shape)
                 assert len(grad_perm.shape) == 2
                 assert len(phi_grad.shape) == 2
                 metrics["perm/grad_norm"] = jnp.nanmean(jnp.linalg.norm(grad_perm, axis=-1))
