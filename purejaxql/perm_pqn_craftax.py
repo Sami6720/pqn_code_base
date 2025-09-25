@@ -270,12 +270,12 @@ class QNetworkPerm(nn.Module):
                 B, N = scores.shape
                 K = topk_idx.shape[-1]
                 counts = jnp.bincount(
-                    topk_idx.reshape(-1), minlength=N)
+                    topk_idx.reshape(-1), length=self.config["NUM_EXPERTS"])
                 f_i = counts.astype(jnp.float32) / (B * K)
                 # Soft marginal P_i (diff): average full softmax over all experts
                 probs_all = nn.softmax(scores, axis=-1)                                  # [B, N]
                 P_i = jnp.mean(probs_all, axis=0)                                        # [N]
-                aux_loss = alpha * jnp.sum(P_i, f_i)
+                aux_loss = alpha * jnp.sum(P_i * f_i, axis=0)
                 self.sow("load_balancing", "aux_loss", aux_loss)
 
                 # mask = jnp.zeros_like(scores)
@@ -285,23 +285,33 @@ class QNetworkPerm(nn.Module):
                 gates = nn.softmax(topk_scores, axis=-1)
 
                 if log_int:
-                    for i, x in jnp.mean(probs_all, axis=0):
-                        self.sow("intermediates", f"expert_{i}_probs", x)
+                    mean_gates = jnp.mean(gates, axis=0)
+                    mean_probs = jnp.mean(probs_all, axis=0)
+                    for i in range(self.config["NUM_EXPERTS"]):
+                        self.sow("intermediates", f"expert_{i}_probs", mean_probs[i])
 
-                    for i, x in jnp.mean(gates, axis=0):
-                        self.sow("intermediates", f"gates_{i}_probs", x)
+                    for i in range(self.config["TOPK"]):
+                        self.sow("intermediates", f"gates_{i}_probs", mean_gates[i])
 
 
                 for i in range(self.num_layers):
-                    B, D = x.shape
+
+                    if i == 0:
+                        B, D = x.shape
+                    else:
+                        B, K, D = x.shape
 
                     W = self.param(f"layer_{i}_kernel", nn.linear.default_kernel_init,
                                    (self.config["NUM_EXPERTS"],
                                    D, self.hidden_size))
-                    b = self.param(f"layer_{i}_bias", nn.initializers.zeros_init, (self.config['NUM_EXPERTS'], self.hidden_size))
+                    b = self.param(f"layer_{i}_bias", nn.initializers.zeros_init(), (self.config['NUM_EXPERTS'], self.hidden_size))
                     W_sel = W[topk_idx]
                     b_sel = b[topk_idx]
-                    x = einsum(x, W_sel, "b d, b k d d_out -> b k d_out")
+                    if i == 0:
+                        x = einsum(x, W_sel, "b d, b k d d_out -> b k d_out")
+                    else:
+                        x = einsum(x, W_sel, "b k d, b k d d_out -> b k d_out")
+
                     x += b_sel
 
                     x = normalize(x)
@@ -1437,6 +1447,7 @@ def make_train(config):
 
 
                             if config["USE_TOPK_MULTI_EXPERT"]:
+                                print("get herel topk")
                                 for i in range(config["NUM_EXPERTS"]):
                                     expert_weights = _last_sown(inter_p, f"expert_{i}_probs")
                                     out[f"perm/expert_{i}/weight"] = expert_weights
