@@ -35,7 +35,7 @@ from analysis_helpers import (
     routing_utilization, expert_dormant_fraction, phi_norms, q_stats,
 )
 import flax
-from einops import rearrange, reduce, einsum
+from einops import rearrange, reduce, einsum, repeat
 
 from flax import traverse_util
 
@@ -253,6 +253,59 @@ class QNetworkPerm(nn.Module):
             else:
                 # dummy normalize input for global compatibility
                 x_dummy = BatchRenorm(use_running_average=not train)(x)
+
+
+            if self.config["USE_TOPK_MULTI_EXPERT"]:
+
+                expert_embeds = self.param("expert_ids", nn.linear.default_embed_init, (self.config["NUM_EXPERTS"], self.hidden_size))
+                input_expert_query = nn.Dense(self.hidden_size)(x)
+                scores = einsum(expert_embeds, input_expert_query, "n d, b d -> b n")
+                # probs = nn.softmax(scores, axis=-1)
+
+                topk_scores, topk_idx = jax.lax.top_k(scores, self.config["TOPK"]) # (B, K), (B, K)
+
+                #NOTE: aux loss computation.
+                # Hard usage f_i (non-diff): count how often each expert was selected in top-k
+                alpha = float(self.config.get("EXP_BAL_ALPHA", 0.001))
+                B, N = scores.shape
+                K = topk_idx.shape[-1]
+                counts = jnp.bincount(
+                    topk_idx.reshape(-1), minlength=N)
+                f_i = counts.astype(jnp.float32) / (B * K)
+                # Soft marginal P_i (diff): average full softmax over all experts
+                probs_all = nn.softmax(scores, axis=-1)                                  # [B, N]
+                P_i = jnp.mean(probs_all, axis=0)                                        # [N]
+                aux_loss = alpha * jnp.sum(P_i, f_i)
+                self.sow("load_balancing", "aux_loss", aux_loss)
+
+                # mask = jnp.zeros_like(scores)
+                # mask = mask.at[jnp.arange(scores.shape[0])[:, None], topk_idx].set(1)
+                # scores *= mask
+                # gates = topk_scores / topk_scores.sum(axis=-1, keepdims=True)
+                gates = nn.softmax(topk_scores, axis=-1)
+
+
+                for i in range(self.num_layers):
+                    B, D = x.shape
+
+                    W = self.param(f"layer_{i}_kernel", nn.linear.default_kernel_init,
+                                   (self.config["NUM_EXPERTS"],
+                                   D, self.hidden_size))
+                    b = self.param(f"layer_{i}_bias", nn.initializers.zeros_init, (self.config['NUM_EXPERTS'], self.hidden_size))
+                    W_sel = W[topk_idx]
+                    b_sel = b[topk_idx]
+                    x = einsum(x, W_sel, "b d, b k d d_out -> b k d_out")
+                    x += b_sel
+
+                    x = normalize(x)
+                    x = nn.relu(x)
+
+
+                x = einsum(x, gates, "b k d, b k -> b d")
+
+                x = nn.Dense(self.action_dim)(x)
+                return x
+
 
         for l in range(self.num_layers):
             x = nn.Dense(self.hidden_size)(x)
@@ -914,15 +967,27 @@ def make_train(config):
                         minibatch, _ = minibatch_and_target
 
                         def _loss_fn_perm(params_perm, params_trans):
-                            q_vals_perm, updates_perm = network_perm.apply(
-                                    {
-                                    "params": params_perm, 
-                                    "batch_stats": train_state_perm.batch_stats
-                                    },
-                                minibatch.obs,
-                                mutable=["batch_stats"],
-                                train=True
-                            )
+
+                            if config["USE_TOPK_MULTI_EXPERT"]:
+                                q_vals_perm, updates_perm = network_perm.apply(
+                                        {
+                                        "params": params_perm, 
+                                        "batch_stats": train_state_perm.batch_stats
+                                        },
+                                    minibatch.obs,
+                                    mutable=["batch_stats", "load_balancing"],
+                                    train=True
+                                )
+                            else:
+                                q_vals_perm, updates_perm = network_perm.apply(
+                                        {
+                                        "params": params_perm, 
+                                        "batch_stats": train_state_perm.batch_stats
+                                        },
+                                    minibatch.obs,
+                                    mutable=["batch_stats"],
+                                    train=True
+                                )
                             q_vals_perm = jnp.take_along_axis(
                                 q_vals_perm,
                                 jnp.expand_dims(minibatch.action, axis=-1),
@@ -950,6 +1015,10 @@ def make_train(config):
                             target = jax.lax.stop_gradient(q_vals_trans + old_p_val)
 
                             loss = 0.5 * jnp.square(target - q_vals_perm).mean()
+
+                            if config["USE_TOPK_MULTI_EXPERT"]:
+                                loss += updates_perm["load_balancing"]["aux_loss"][-1]
+
                             return loss, updates_perm
 
                         (loss_perm, updates_perm), grads = jax.value_and_grad(
