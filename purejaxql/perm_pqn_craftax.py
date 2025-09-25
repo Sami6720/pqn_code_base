@@ -284,6 +284,13 @@ class QNetworkPerm(nn.Module):
                 # gates = topk_scores / topk_scores.sum(axis=-1, keepdims=True)
                 gates = nn.softmax(topk_scores, axis=-1)
 
+                if log_int:
+                    for i, x in jnp.mean(probs_all, axis=0):
+                        self.sow("intermediates", f"expert_{i}_probs", x)
+
+                    for i, x in jnp.mean(gates, axis=0):
+                        self.sow("intermediates", f"gates_{i}_probs", x)
+
 
                 for i in range(self.num_layers):
                     B, D = x.shape
@@ -1278,6 +1285,10 @@ def make_train(config):
                         out[f"perm/expert_{i}/qvar_batch"] = nan
                         out[f"perm/expert_{i}/weight"] = nan
 
+                    for i in range(int(config.get("TOPK", 0))):
+                        out[f"perm/gate_{i}/weight"] = nan
+
+
                     return out
 
                 # ----- Core analysis (heavy path runs only at interval) -----
@@ -1422,6 +1433,15 @@ def make_train(config):
                                     acts_i.append(a)
                             means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
                             out[f"perm/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+
+
+                            if config["USE_TOPK_MULTI_EXPERT"]:
+                                for i in range(config["NUM_EXPERTS"]):
+                                    expert_weights = _last_sown(inter_p, f"expert_{i}_probs")
+                                    out[f"perm/expert_{i}/weight"] = expert_weights
+                                for i in range(config["TOPK"]):
+                                    expert_weights = _last_sown(inter_p, f"gates_{i}_probs")
+                                    out[f"perm/gate_{i}/weight"] = expert_weights
 
                         # Q diagnostics (overall permanent)
                         qn_p, qvarA_p, qvarB_p = q_stats(q_p)
