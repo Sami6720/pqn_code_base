@@ -576,11 +576,12 @@ def make_train(config):
 
 
     #NOTE: Observations for computing dormant neurons
-    all_obs_files = os.listdir("obs_fixed")[:8]
-    all_processed_obs = [rearrange(jnp.load(f'obs_fixed/{f}'), 'x b ... -> (x b) ...') for f in all_obs_files]
-    all_processed_obs = jnp.stack(all_processed_obs, axis=0)
-    all_processed_obs = rearrange(all_processed_obs, 'x b ... -> (x b) ...')
-    print(f"All processed observation shapes {all_processed_obs.shape}")
+    # all_obs_files = os.listdir("obs_fixed")[:8]
+    # all_processed_obs = [rearrange(jnp.load(f'obs_fixed/{f}'), 'x b ... -> (x b) ...') for f in all_obs_files]
+    # all_processed_obs = jnp.stack(all_processed_obs, axis=0)
+    # all_processed_obs = rearrange(all_processed_obs, 'x b ... -> (x b) ...')
+
+    # print(f"All processed observation shapes {all_processed_obs.shape}")
 
 
     def train(rng):
@@ -1336,8 +1337,8 @@ def make_train(config):
                     if LOG_INTERNALS:
                         q_t, coll_t = network.apply(variables_t, obs, train=False, mutable=['intermediates'])
                         inter_t = _get_intermediates(coll_t)
-                        q_t_fixed, coll_t_fixed = network.apply(variables_t, all_processed_obs, train=False, mutable=['intermediates'])
-                        inter_t_fixed = _get_intermediates(coll_t_fixed)
+                        # q_t_fixed, coll_t_fixed = network.apply(variables_t, all_processed_obs, train=False, mutable=['intermediates'])
+                        # inter_t_fixed = _get_intermediates(coll_t_fixed)
                     else:
                         q_t = network.apply(variables_t, obs, train=False)
                         inter_t = {}
@@ -1352,13 +1353,13 @@ def make_train(config):
                                 trans_layer_acts.append(a)
                         means_all = _concat_means(trans_layer_acts) # [L, H]
                         out["trans/dormant_all"] = _f32(jnp.mean(means_all < DORMANT_TAU))
-                        trans_layer_acts_fixed = []
-                        for j in range(int(config.get("NUM_LAYERS", 2))):
-                            a = _last_sown(inter_t_fixed, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
-                            if a is not None:
-                                trans_layer_acts_fixed.append(a)
-                        means_all = _concat_means(trans_layer_acts_fixed) # [L, H]
-                        out["trans/dormant_all_fixed"] = _f32(jnp.mean(means_all < DORMANT_TAU))
+                        # trans_layer_acts_fixed = []
+                        # for j in range(int(config.get("NUM_LAYERS", 2))):
+                        #     a = _last_sown(inter_t_fixed, f'trans_layer{j}_act')  # [B, D] (post-ReLU)
+                        #     if a is not None:
+                        #         trans_layer_acts_fixed.append(a)
+                        # means_all = _concat_means(trans_layer_acts_fixed) # [L, H]
+                        # out["trans/dormant_all_fixed"] = _f32(jnp.mean(means_all < DORMANT_TAU))
 
                     # last_hidden effective rank
                     last_hidden_t = _last_sown(inter_t, 'last_hidden')
@@ -1376,8 +1377,8 @@ def make_train(config):
                         if LOG_INTERNALS:
                             q_p, coll_p = network_perm.apply(variables_p, obs, train=False, mutable=['intermediates'])
                             inter_p = _get_intermediates(coll_p)
-                            q_p_fixed, coll_p_fixed = network_perm.apply(variables_p, all_processed_obs, train=False, mutable=['intermediates'])
-                            inter_p_fixed = _get_intermediates(coll_p_fixed)
+                            # q_p_fixed, coll_p_fixed = network_perm.apply(variables_p, all_processed_obs, train=False, mutable=['intermediates'])
+                            # inter_p_fixed = _get_intermediates(coll_p_fixed)
                         else:
                             q_p = network_perm.apply(variables_p, obs, train=False)
                             inter_p = {}
@@ -1398,14 +1399,14 @@ def make_train(config):
                                             acts_i.append(a)
                                     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
                                     out[f"perm/expert_{i}/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
-                                for i in range(num_experts):
-                                    acts_i = []
-                                    for j in range(num_layers):
-                                        a = _last_sown(inter_p_fixed, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                        if a is not None:
-                                            acts_i.append(a)
-                                    means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
-                                    out[f"perm/expert_{i}/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                                # for i in range(num_experts):
+                                #     acts_i = []
+                                #     for j in range(num_layers):
+                                #         a = _last_sown(inter_p_fixed, f'perm_exp{i}_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                                #         if a is not None:
+                                #             acts_i.append(a)
+                                #     means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                                #     out[f"perm/expert_{i}/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
                             # per-expert feature srank (NOT full-module rank)
                             y_tilda_tilda = _last_sown(inter_p, 'perm_y_tilda_tilda')  # [B,N,M,D]
@@ -1416,23 +1417,23 @@ def make_train(config):
                                 for i in range(num_experts):
                                     out[f"perm/expert_{i}/feat_srank"] = _f32(sranks[i])
                         else:
-                            last_hidden_p = _last_sown(inter_p, 'last_hidden')
-                            out["perm/feat_srank"] = _f32(effective_rank(last_hidden_p, SRANK_DELTA))
-                            acts_i = []
-                            num_layers  = int(config.get("NUM_LAYERS", 2))
-                            for j in range(num_layers):
-                                a = _last_sown(inter_p, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                if a is not None:
-                                    acts_i.append(a)
-                            means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
-                            out[f"perm/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
-                            acts_i = []
-                            for j in range(num_layers):
-                                a = _last_sown(inter_p_fixed, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
-                                if a is not None:
-                                    acts_i.append(a)
-                            means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
-                            out[f"perm/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                            # last_hidden_p = _last_sown(inter_p, 'last_hidden')
+                            # out["perm/feat_srank"] = _f32(effective_rank(last_hidden_p, SRANK_DELTA))
+                            # acts_i = []
+                            # num_layers  = int(config.get("NUM_LAYERS", 2))
+                            # for j in range(num_layers):
+                            #     a = _last_sown(inter_p, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                            #     if a is not None:
+                            #         acts_i.append(a)
+                            # means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                            # out[f"perm/dormant_all"] = _f32(jnp.mean(means_i < DORMANT_TAU))
+                            # acts_i = []
+                            # for j in range(num_layers):
+                            #     a = _last_sown(inter_p_fixed, f'perm_layer{j}_act')  # [B, ...], sowed after each Dense->Norm->ReLU
+                            #     if a is not None:
+                            #         acts_i.append(a)
+                            # means_i = _concat_means(acts_i)  # 1D: all units across expert’s hidden layers
+                            # out[f"perm/dormant_all_fixed"] = _f32(jnp.mean(means_i < DORMANT_TAU))
 
 
                             if config["USE_TOPK_MULTI_EXPERT"]:
