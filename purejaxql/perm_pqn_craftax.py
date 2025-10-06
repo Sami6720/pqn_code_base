@@ -42,6 +42,10 @@ from flax import traverse_util
 def count_params(params: Any) -> int:
     """Total number of scalars in a JAX/Flax params PyTree."""
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
+def ravel_params_only(tree_with_M_first):
+    leaves = jax.tree.leaves(tree_with_M_first)          # each (M, ...)
+    leaves = [l.reshape((l.shape[0], -1)) for l in leaves]
+    return jnp.concatenate(leaves, axis=1)              
 
 class QNetworkPerm(nn.Module):
     action_dim: int
@@ -665,8 +669,8 @@ def make_train(config):
                     end_value=1e-21,
                     #TODO: Maybe transition_steps needs to change?
                     transition_steps=(config["NUM_UPDATES_DECAY"])
-                    * config["NUM_MINIBATCHES"]
-                    * config["NUM_EPOCHS"],
+                    * config["NUM_MINIBATCHES_PERM"]
+                    * config["NUM_EPOCHS_PERM"],
                 )
                 lr = lr_scheduler if config.get("LR_PERM_LINEAR_DECAY", False) else config["LR_PERM"]
                 tx = optax.chain(
@@ -1069,7 +1073,7 @@ def make_train(config):
                         )  # num_steps*num_envs (batch_size), ...
                         x = jax.random.permutation(rng, x)  # shuffle the transitions
                         x = x.reshape(
-                            config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+                            config["NUM_MINIBATCHES_PERM"], -1, *x.shape[1:]
                         )  # num_mini_updates, batch_size/num_mini_updates, ...
                         return x
 
@@ -1155,8 +1159,8 @@ def make_train(config):
 
                     print(jax.flatten_util.ravel_pytree(phi_grads)[0].shape)
 
-                    return (train_state_perm, modified_train_states_trans, rng), (loss, jax.flatten_util.ravel_pytree(grads_perm)[0],
-                                                                                  jax.flatten_util.ravel_pytree(phi_grads)[0]
+                    return (train_state_perm, modified_train_states_trans, rng), (loss, ravel_params_only(grads_perm),
+                                                                                  ravel_params_only(phi_grads)
                                                                                   )
 
 
@@ -1167,11 +1171,11 @@ def make_train(config):
 
                 # None instead of zero since wandb filters out automatically.
                 dummy_loss = jnp.full(
-                    (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES"]), jnp.nan)
+                    (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES_PERM"]), jnp.nan)
                 dummy_grad = jnp.full(
-                    (config["NUM_EPOCHS_PERM"], permanent_network_parameter_count), jnp.nan)
+                    (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES_PERM"], permanent_network_parameter_count), jnp.nan)
                 dummy_phi_grad = jnp.full(
-                    (config["NUM_EPOCHS_PERM"], 4096), jnp.nan # 4096 is the number of parameters in phi if use_soft_moe
+                    (config["NUM_EPOCHS_PERM"], config["NUM_MINIBATCHES_PERM"], 4096), jnp.nan # 4096 is the number of parameters in phi if use_soft_moe
                 )
                 (train_state_perm, train_state, rng), (loss_perm, grad_perm, phi_grad) = jax.lax.cond(
                     is_perm_learn_time,
@@ -1194,8 +1198,8 @@ def make_train(config):
                 metrics["perm/loss"] = jnp.nanmean(loss_perm)
                 print("permanent gradient shape", grad_perm.shape)
                 print("phi gradient shape", phi_grad.shape)
-                assert len(grad_perm.shape) == 2
-                assert len(phi_grad.shape) == 2
+                assert len(grad_perm.shape) == 3
+                assert len(phi_grad.shape) == 3
                 metrics["perm/grad_norm"] = jnp.nanmean(jnp.linalg.norm(grad_perm, axis=-1))
                 metrics["perm/phi_grad_norm"] = jnp.nanmean(jnp.linalg.norm(phi_grad, axis=-1))
 
