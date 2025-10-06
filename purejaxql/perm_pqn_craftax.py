@@ -1048,7 +1048,6 @@ def make_train(config):
                             batch_stats=updates_perm["batch_stats"],
                         )
 
-                        import flax
                         # Flatten grads to find phi
                         if config["USE_SOFT_MOE_MULTI_EXPERT"]:
                             flat_grads = flax.traverse_util.flatten_dict(grads, sep="/")
@@ -1119,7 +1118,6 @@ def make_train(config):
                                 # Get a fresh param tree for this module on the same input shape
                                 new_params_full = network.init(rng, dummy_input, train=False)['params']
                                 # Splice only the head(s)
-                                import flax
                                 flat_old = flax.traverse_util.flatten_dict(ts.params, sep="/")
                                 flat_new = flax.traverse_util.flatten_dict(new_params_full, sep="/")
                                 # jax.debug.print("get here, {k}", k=flat_new.keys())
@@ -1150,10 +1148,6 @@ def make_train(config):
                        train_state,
                         rng
                     )
-
-
-                    import flax
-                    from flax import traverse_util
 
                     print(type(grads_perm))
                     print(jax.flatten_util.ravel_pytree(grads_perm)[0].shape)
@@ -1216,8 +1210,6 @@ def make_train(config):
                 DORMANT_TAU       = float(config.get("DORMANT_TAU", 0.025))
                 LOG_INTERNALS     = bool(config.get("LOG_INTERNALS", True))
 
-                import flax
-                from flax import traverse_util
 
                 # ----- util: ensure every metric is float32 to satisfy lax.cond type equality -----
                 def _f32(x):
