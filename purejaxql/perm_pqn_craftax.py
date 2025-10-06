@@ -1102,6 +1102,14 @@ def make_train(config):
                                     lambda x: config["TRANSIENT_WEIGHT_DECAY"] *  x, train_state_trans.params
                                 )
                             )
+                        elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'multiplicative_last':
+                            flattened_dict = flax.traverse_util.flatten_dict(train_state_trans.params, sep='/')
+                            for key in flattened_dict.keys():
+                                if 'action_head' in key:
+                                    flattened_dict = {**flattened_dict, key: flattened_dict[key] * config["TRANSIENT_WEIGHT_DECAY"]}
+                            temp_train_state = train_state_trans.replace(
+                                params=flax.traverse_util.unflatten_dict(flattened_dict, sep='/'))
+
                         elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'no_reset':
                             temp_train_state = train_state_trans
                         elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'reinit_action_heads':
