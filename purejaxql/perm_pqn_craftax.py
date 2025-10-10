@@ -638,20 +638,20 @@ def make_train(config):
         )
 
 
-        perm_buffer = flashbax.make_item_buffer(config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
-                                                config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
-                                                config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
+        perm_buffer = flashbax.make_item_buffer( config["PERM_UPDATE_FREQ"],
+                                                 config["PERM_UPDATE_FREQ"],
+                                                 config["PERM_UPDATE_FREQ"],
                                                 )
 
-        init_x = jnp.zeros((config["NUM_ENVS"], *env.observation_space(env_params).shape))
+        init_x = jnp.zeros((1, config["NUM_ENVS"], *env.observation_space(env_params).shape))
         fake_timestep = Transition(
             obs=init_x,
-            action=jnp.zeros((1,), dtype=jnp.int32),
-            reward=jnp.zeros((1,)),
-            done=jnp.zeros((1,), dtype=bool),
+            action=jnp.zeros((1, config["NUM_ENVS"],), dtype=jnp.int32),
+            reward=jnp.zeros((1, config["NUM_ENVS"],)),
+            done=jnp.zeros((1, config["NUM_ENVS"],), dtype=bool),
             next_obs=init_x,
-            q_val=jnp.zeros((1, env.action_space(env_params).n)),
-            old_p_val=jnp.zeros((1, env.action_space(env_params).n)),
+            q_val=jnp.zeros((1, config["NUM_ENVS"], env.action_space(env_params).n)),
+            old_p_val=jnp.zeros((1, config["NUM_ENVS"], env.action_space(env_params).n)),
         )
         buffer_state = perm_buffer.init(fake_timestep)
 
@@ -788,7 +788,17 @@ def make_train(config):
                 print("Transition qval shape being added to buffer: ", transition.q_val.shape)
                 print("Transition old_p_val shape being added to buffer: ", transition.old_p_val.shape)
 
-                buffer_state = perm_buffer.add(buffer_state, transition)
+                buffer_transition = Transition(
+                    obs=last_obs[None, ...],
+                    action=new_action[None, ...],
+                    reward=(config.get("REW_SCALE", 1) * reward)[None, ...],
+                    done=new_done[None, ...],
+                    next_obs=new_obs[None, ...],
+                    q_val=q_vals[None, ...],
+                    old_p_val=q_vals_perm[None, ...],
+                )
+
+                buffer_state = perm_buffer.add(buffer_state, buffer_transition)
                 return (new_obs, new_env_state, buffer_state, rng), (transition, info, q_val_perm_proportion)
 
             # step the env
@@ -946,6 +956,12 @@ def make_train(config):
                     return x
 
                 rng, _rng = jax.random.split(rng)
+                print("transitions. obs shape being minibatched for transient: ", transitions.obs.shape)
+                print("transitions. action shape being minibatched for transient: ", transitions.action.shape)
+                print("transitions. reward shape being minibatched for transient: ", transitions.reward.shape)
+                print("transitions. done shape being minibatched for transient: ", transitions.done.shape)
+                print("transitions. qval shape being minibatched for transient: ", transitions.q_val.shape)
+                print("transitions. old_p_val shape being minibatched for transient: ", transitions.old_p_val.shape)
                 minibatches = jax.tree_util.tree_map(
                     lambda x: preprocess_transition(x, _rng), transitions
                 )  # num_actors*num_envs (batch_size), ...
@@ -1107,8 +1123,20 @@ def make_train(config):
                         return x
 
                     rng, _rng = jax.random.split(rng)
-                    transitions = perm_buffer.sample(buffer_state, rng)
-                    print("Shape of transitions sampled from buffer: ", transitions.shape)
+                    # print("transitions. obs shape being original: ", transitions.obs.shape)
+                    # print("transitions. action shape being original: ", transitions.action.shape)
+                    # print("transitions. reward shape being original: ", transitions.reward.shape)
+                    # print("transitions. done shape being original: ", transitions.done.shape)
+                    # print("transitions. qval shape being original: ", transitions.q_val.shape)
+                    # print("transitions. old_p_val shape being original: ", transitions.old_p_val.shape)
+                    transitions = perm_buffer.sample(buffer_state, rng).experience
+                    transitions = jax.tree_map(lambda x: rearrange(x, "n t ... -> (n t) ..."), transitions)
+                    print("transitions. obs shape being sampled from the buffer: ", transitions.obs.shape)
+                    print("transitions. action shape being sampled from the buffer: ", transitions.action.shape)
+                    print("transitions. reward shape being sampled from the buffer: ", transitions.reward.shape)
+                    print("transitions. done shape being sampled from the buffer: ", transitions.done.shape)
+                    print("transitions. qval shape being sampled from the buffer: ", transitions.q_val.shape)
+                    print("transitions. old_p_val shape being sampled from the buffer: ", transitions.old_p_val.shape)
                     rng, _rng = jax.random.split(rng)
                     minibatches = jax.tree_util.tree_map(
                         lambda x: preprocess_transition_perm(x, _rng), transitions
@@ -1161,7 +1189,7 @@ def make_train(config):
                 #NOTE: Reset buffer.
                 buffer_state = jax.lax.cond(
                     is_perm_learn_time,
-                    lambda bs: bs.init(fake_timestep),
+                    lambda _: perm_buffer.init(fake_timestep),
                     lambda bs: bs,
                     buffer_state
                 )
