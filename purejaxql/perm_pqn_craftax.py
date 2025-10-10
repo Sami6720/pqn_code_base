@@ -38,6 +38,7 @@ import flax
 from einops import rearrange, reduce, einsum, repeat
 
 from flax import traverse_util
+import flashbax
 
 def count_params(params: Any) -> int:
     """Total number of scalars in a JAX/Flax params PyTree."""
@@ -636,6 +637,24 @@ def make_train(config):
             config=config
         )
 
+
+        perm_buffer = flashbax.make_item_buffer(config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
+                                                config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
+                                                config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
+                                                )
+
+        init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+        fake_timestep = Transition(
+            obs=init_x,
+            action=jnp.zeros((1,), dtype=jnp.int32),
+            reward=jnp.zeros((1,)),
+            done=jnp.zeros((1,)),
+            next_obs=init_x,
+            q_val=jnp.zeros((1, env.action_space(env_params).n)),
+            old_p_val=jnp.zeros((1, env.action_space(env_params))),
+        )
+        buffer_state = perm_buffer.init(fake_timestep)
+
         def create_agent(rng):
             init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
             network_variables = network.init(rng, init_x, train=False)
@@ -697,7 +716,7 @@ def make_train(config):
         # TRAINING LOOP
         def _update_step(runner_state, unused):
 
-            train_state, train_state_perm, expl_state, test_metrics, rng = runner_state
+            train_state, train_state_perm, expl_state, test_metrics, buffer_state, rng = runner_state
 
             old_params_perm = train_state_perm.params
 
@@ -705,7 +724,7 @@ def make_train(config):
 
             # SAMPLE PHASE
             def _step_env(carry, _):
-                last_obs, env_state, rng = carry
+                last_obs, env_state, buffer_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 q_vals = network.apply(
                     {
@@ -761,13 +780,15 @@ def make_train(config):
                     q_val=q_vals,
                     old_p_val=q_vals_perm
                 )
-                return (new_obs, new_env_state, rng), (transition, info, q_val_perm_proportion)
+
+                buffer_state = perm_buffer.add(buffer_state, transition)
+                return (new_obs, new_env_state, buffer_state, rng), (transition, info, q_val_perm_proportion)
 
             # step the env
             rng, _rng = jax.random.split(rng)
-            (*expl_state, rng), (transitions, infos, q_val_perm_proportions) = jax.lax.scan(
+            (*expl_state, buffer_state, rng), (transitions, infos, q_val_perm_proportions) = jax.lax.scan(
                 _step_env,
-                (*expl_state, _rng),
+                (*expl_state, buffer_state, _rng),
                 None,
                 config["NUM_STEPS"],
             )
@@ -1079,6 +1100,8 @@ def make_train(config):
                         return x
 
                     rng, _rng = jax.random.split(rng)
+                    transitions = perm_buffer.sample(buffer_state, rng)
+                    rng, _rng = jax.random.split(rng)
                     minibatches = jax.tree_util.tree_map(
                         lambda x: preprocess_transition_perm(x, _rng), transitions
                     )  # num_actors*num_envs (batch_size), ...
@@ -1126,6 +1149,13 @@ def make_train(config):
                     lambda ts: ts.replace(n_updates=ts.n_updates + 1),
                     lambda ts: ts,
                     train_state_perm
+                )
+                #NOTE: Reset buffer.
+                buffer_state = jax.lax.cond(
+                    is_perm_learn_time,
+                    lambda bs: bs.init(fake_timestep),
+                    lambda bs: bs,
+                    buffer_state
                 )
 
                 metrics["perm/loss"] = jnp.nanmean(loss_perm)
@@ -1552,7 +1582,7 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_rng)
 
-            runner_state = (modified_train_states_trans, train_state_perm, tuple(expl_state), test_metrics, rng)
+            runner_state = (modified_train_states_trans, train_state_perm, tuple(expl_state), test_metrics, buffer_state, rng)
 
             return runner_state, metrics
 
@@ -1603,7 +1633,7 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, train_state_perm, expl_state, test_metrics, _rng)
+        runner_state = (train_state, train_state_perm, expl_state, test_metrics, buffer_state, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
