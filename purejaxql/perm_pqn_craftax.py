@@ -643,15 +643,15 @@ def make_train(config):
                                                 config["NUM_ENVS"] * config["NUM_STEPS"] * config["PERM_UPDATE_FREQ"],
                                                 )
 
-        init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+        init_x = jnp.zeros((config["NUM_ENVS"], *env.observation_space(env_params).shape))
         fake_timestep = Transition(
             obs=init_x,
             action=jnp.zeros((1,), dtype=jnp.int32),
             reward=jnp.zeros((1,)),
-            done=jnp.zeros((1,)),
+            done=jnp.zeros((1,), dtype=bool),
             next_obs=init_x,
             q_val=jnp.zeros((1, env.action_space(env_params).n)),
-            old_p_val=jnp.zeros((1, env.action_space(env_params))),
+            old_p_val=jnp.zeros((1, env.action_space(env_params).n)),
         )
         buffer_state = perm_buffer.init(fake_timestep)
 
@@ -780,6 +780,13 @@ def make_train(config):
                     q_val=q_vals,
                     old_p_val=q_vals_perm
                 )
+
+                print("Transition obs shape being added to buffer: ", transition.obs.shape)
+                print("Transition action shape being added to buffer: ", transition.action.shape)
+                print("Transition reward shape being added to buffer: ", transition.reward.shape)
+                print("Transition done shape being added to buffer: ", transition.done.shape)
+                print("Transition qval shape being added to buffer: ", transition.q_val.shape)
+                print("Transition old_p_val shape being added to buffer: ", transition.old_p_val.shape)
 
                 buffer_state = perm_buffer.add(buffer_state, transition)
                 return (new_obs, new_env_state, buffer_state, rng), (transition, info, q_val_perm_proportion)
@@ -1101,6 +1108,7 @@ def make_train(config):
 
                     rng, _rng = jax.random.split(rng)
                     transitions = perm_buffer.sample(buffer_state, rng)
+                    print("Shape of transitions sampled from buffer: ", transitions.shape)
                     rng, _rng = jax.random.split(rng)
                     minibatches = jax.tree_util.tree_map(
                         lambda x: preprocess_transition_perm(x, _rng), transitions
