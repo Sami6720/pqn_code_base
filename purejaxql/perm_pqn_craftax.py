@@ -46,7 +46,53 @@ def count_params(params: Any) -> int:
 def ravel_params_only(tree_with_M_first):
     leaves = jax.tree.leaves(tree_with_M_first)          # each (M, ...)
     leaves = [l.reshape((l.shape[0], -1)) for l in leaves]
-    return jnp.concatenate(leaves, axis=1)              
+    return jnp.concatenate(leaves, axis=1)
+
+
+def reset_head_moments_in_opt_state(train_state, head_prefix="action_head"):
+    """
+    Zero out mu/nu for parameters under `head_prefix` in the RAdam state,
+    leaving the rest of the optimizer state (and global count) intact.
+    """
+    opt_state = train_state.opt_state
+
+    # Pull out the RAdam state. Your printouts show:
+    # opt_state == (EmptyState(), (ScaleByAdamState(...), EmptyState()))
+    clip_state = opt_state[0]
+    radam_state = opt_state[1][0]
+    trailing_state = opt_state[1][1]  # often EmptyState()
+
+    # Flatten mu/nu to operate by string keys like "action_head/kernel"
+    mu_flat = traverse_util.flatten_dict(radam_state.mu, sep='/')
+    nu_flat = traverse_util.flatten_dict(radam_state.nu, sep='/')
+
+    def maybe_zero_map(dflat):
+        new = {}
+        for k, v in dflat.items():
+            # k is a string path like "Dense_0/kernel" or "action_head/kernel"
+            if k.startswith(head_prefix + "/") or k == head_prefix:
+                new[k] = jnp.zeros_like(v)
+            else:
+                new[k] = v
+        return new
+
+    mu_flat_new = maybe_zero_map(mu_flat)
+    nu_flat_new = maybe_zero_map(nu_flat)
+
+    # Unflatten back to the original PyTree structures
+    mu_new = traverse_util.unflatten_dict(mu_flat_new, sep='/')
+    nu_new = traverse_util.unflatten_dict(nu_flat_new, sep='/')
+
+    # Rebuild the ScaleByAdamState with updated moments, keep count as-is
+    # ScaleByAdamState is a NamedTuple/dataclass; this construction is safe:
+    ScaleByAdamState = type(radam_state)
+    radam_state_new = ScaleByAdamState(count=radam_state.count, mu=mu_new, nu=nu_new)
+
+    # Reassemble the full opt_state structure
+    new_opt_state = (clip_state, (radam_state_new, trailing_state))
+
+    # Return a new TrainState with the modified opt_state
+    return train_state.replace(opt_state=new_opt_state)
 
 class QNetworkPerm(nn.Module):
     action_dim: int
@@ -669,6 +715,18 @@ def make_train(config):
                 batch_stats=network_variables["batch_stats"],
                 tx=tx,
             )
+
+            print("opt_state {x} ",train_state.opt_state)
+            print("len(opt_state)", len(train_state.opt_state))
+            print("len(opt_state[0])", len(train_state.opt_state[0]))
+            print("len(opt_state[1])", len(train_state.opt_state[1]))
+            print("len(opt_state[1][0])", len(train_state.opt_state[1][0]))
+            print("type(opt_state[1][0])", type(train_state.opt_state[1][0]))
+            print("len(opt_state[1][1])", len(train_state.opt_state[1][1]))
+            print("type opt state ", type(train_state.opt_state))
+            print("type opt state ", train_state.opt_state)
+            flattened_dict = flax.traverse_util.flatten_dict(train_state.opt_state[1][0].mu, sep='/')
+            print(f"flatten_opt_state : ", flattened_dict.keys())
             return train_state
 
 
@@ -1225,6 +1283,22 @@ def make_train(config):
                         temp_train_state = train_state_trans.replace(
                             params=flax.traverse_util.unflatten_dict(flattened_dict, sep='/'))
 
+                        #NOTE: Verify code [will be commented out]
+                        # def check_opt_state_worked(name: str='action_head', before_after: str='before'):
+                        #     mu = traverse_util.flatten_dict(temp_train_state.opt_state[1][0].mu, sep="/")
+                        #     nu = traverse_util.flatten_dict(temp_train_state.opt_state[1][0].nu, sep="/")
+                        #     jax.debug.print("{z} {y} reset mu_norm={x}", x=sum(jnp.linalg.norm(v) for k,v in mu.items() if k.startswith(name)), y=before_after, z=name)
+                        #     jax.debug.print("{z} {y} reset nu_norm={x}", x=sum(jnp.linalg.norm(v) for k,v in nu.items() if k.startswith(name)), y=before_after, z=name)
+                        #
+
+                        # check_opt_state_worked('Dense_0/kernel')
+                        # check_opt_state_worked('action_head')
+
+                        temp_train_state = reset_head_moments_in_opt_state(temp_train_state)
+
+                        # check_opt_state_worked('Dense_0/kernel', 'after')
+                        # check_opt_state_worked('action_head', 'after')
+                        #
                     elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'no_reset':
                         temp_train_state = train_state_trans
                     elif config["TRANS_WEIGHT_RESET_STRATEGY"] == 'reinit_action_heads':
@@ -1251,6 +1325,7 @@ def make_train(config):
 
                         init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
                         temp_train_state = reinit_action_heads(train_state, _rng, init_x)
+                        temp_train_state = reset_head_moments_in_opt_state(temp_train_state)
                     else:
                         raise ValueError("Wrong TRANS_WEIGHT_RESET_STRATEGY: ", config["TRANS_WEIGHT_RESET_STRATEGY"])
 
